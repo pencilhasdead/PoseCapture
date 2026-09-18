@@ -318,6 +318,17 @@ def read_metrics(arm_obj, bmap: BoneMap) -> dict:
 
     metrics["ref"] = {"hip_line": metrics["hip_line"],
                       "shoulder_line": metrics["shoulder_line"]}
+    # 静止侧的“眼线”（人物右 -> 左）。它的用处是让 head 的 roll / 转头真的生效：
+    # retarget 里 head 的参照轴是 "eye_line"，解算结果那侧现在由五官（眼角 / 嘴角 / 眉梢 /
+    # 下颌角成对投票）给出；静止侧以前**没有**这个键 —— solve_orientation 拿到 rest_ref=None
+    # 会静默跳过扭转，于是照片里转头 / 歪头的头部信息整体被丢掉（头永远朝着静止方向）。
+    # 这里用肩线（没有就用胯线）：head 骨自己的 roll 约定各家骨架都不同，而肩线 / 胯线天然
+    # 定义“人物左右”（.L 在人物左侧），静止 A/T pose 下头部本来就与肩线对齐。
+    head_lateral = metrics["shoulder_line"]
+    if head_lateral.length < 1e-9:
+        head_lateral = metrics["hip_line"]
+    if head_lateral.length > 1e-9:
+        metrics["ref"]["eye_line"] = head_lateral.normalized()
     # 弯曲轴（肘/膝）刻意不做“对齐到肩线/胯线”的符号翻转：
     # 静止与目标用同一个叉乘约定（上段 x 下段，顺序固定）才是有信息的，
     # 用参考线翻符号在“弯曲轴几乎垂直于参考线”时会变成噪声，导致 roll 随机反向。

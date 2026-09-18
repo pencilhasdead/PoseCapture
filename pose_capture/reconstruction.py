@@ -96,6 +96,23 @@ DEPTH_SIGN_MIN_DELTA = 0.01
 # 照单全收会让手掌横着长在腕上；真实照片里手基本都是顺着小臂伸展的。
 HAND_ALIGN_MAX_DEG = 30.0
 
+# --------------------------------------------------------------------------- 五官 / 头部
+# 五官推出的“头基座”（头骨底 / 上颈口，也就是 head 骨的起点）：耳朵中点大约在眼线下方
+# 0.15 ×（眼睛 -> 下巴）处（成人头部比例：眼线在头高中点，耳道口比眼线低约 2 cm）。
+# 耳朵是身体分支，侧头 / 头发遮挡 / 只检出一只时很不可靠 —— 那时老做法退到“双眼中点”，
+# 那在头顶上，脖子会被拉得又短又歪，改用这张脸自己的比例来定。
+FACE_HEAD_BASE_BELOW_EYE = 0.15
+# 同一个尺度换算到“头顶”：耳线到头骨顶 ≈ 1.1 ×（眼睛 -> 下巴）。
+FACE_HEAD_TIP_ABOVE_BASE = 1.1
+# 下巴没检出来时，用（眼睛 -> 嘴）反推“眼睛 -> 下巴”（成人 ≈ 0.4）。
+FACE_EYE_TO_MOUTH_RATIO = 0.4
+# 耳朵中点离五官估出的头基座超过这个比例（× 眼睛 -> 下巴）就认为耳朵不可信。
+FACE_EAR_TOLERANCE = 0.9
+# 五官成对点的“一致度”下限：|Σ 单位向量| / Σ 权重 低于它就说明这几对点互相矛盾
+# （多半是深度图在脸上给错了），这时只保留画面内的分量、不要前后分量 —— 宁可不转头，
+# 也不要让深度噪声把脑袋拧过来。
+FACE_AXIS_MIN_CONSISTENCY = 0.7
+
 
 def default_options(**overrides) -> dict:
     opts = dict(DEFAULT_OPTIONS)
@@ -154,6 +171,170 @@ def _safe_cross(a: np.ndarray, b: np.ndarray):
     return axis / norm
 
 
+# --------------------------------------------------------------------------- 五官 -> 头部坐标系
+def _confidence(scores, index) -> float:
+    """单个关键点的置信度（用于给五官点对加权）；取不到 / 非有限值就按 0 算。"""
+    try:
+        value = float(np.asarray(scores, dtype=float)[index])
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _pair_direction(points: dict, weights: dict, pairs, plane=None):
+    """成对点投票出的方向（单位向量）+ 用到的点对 + 一致度；点不够返回 ``(None, [], 0.0)``。
+
+    ``plane`` 给定时点先按它搬到三维（正交模式的 ``plane(像素) -> (x, z)``），否则在像素
+    平面上投票。每对点按“解剖权重 × 两端置信度 × 点对基线长度”加权：基线越长方向越可信，
+    置信度低的点（侧头时被遮住的眼角、嘴角）自己会变轻。返回的一致度
+    （``|Σ 单位向量| / Σ 权重``）用来判断这几对点是不是**互相矛盾**。
+    """
+    total = np.zeros(3 if plane is not None else 2, dtype=np.float64)
+    used = []
+    weight_sum = 0.0
+    for key_a, key_b, weight in pairs:
+        point_a, point_b = points.get(key_a), points.get(key_b)
+        if point_a is None or point_b is None:
+            continue
+        if plane is not None:
+            flat_a, flat_b = plane(point_a), plane(point_b)
+            a = np.array((flat_a[0], 0.0, flat_a[1]), dtype=np.float64)
+            b = np.array((flat_b[0], 0.0, flat_b[1]), dtype=np.float64)
+        else:
+            a = np.asarray(point_a, dtype=np.float64)
+            b = np.asarray(point_b, dtype=np.float64)
+        vector = b - a
+        span = float(np.linalg.norm(vector))
+        if span < 1e-9:
+            continue
+        current = float(weight) * min(weights.get(key_a, 1.0), weights.get(key_b, 1.0)) * span
+        if current <= 0.0:
+            continue
+        total += vector / span * current
+        weight_sum += current
+        used.append((key_a, key_b, float(weight)))
+    norm = float(np.linalg.norm(total))
+    if norm < 1e-9 or weight_sum <= 0.0:
+        return None, [], 0.0
+    return total / norm, used, norm / weight_sum
+
+
+def _face_frame(keypoints, scores, thr: float) -> dict:
+    """用 68 点人脸估一套“头部坐标系”，供头 / 脖子用。
+
+    为什么不满足于“耳朵 + 眉毛/下巴”：耳朵是身体分支 —— 侧头、头发遮挡、只检出一只时
+    都会给出很偏的位置，而脖子方向就是“胸上 -> 头基座”，头基座一偏脖子立刻歪；单看
+    眉毛和下巴两个点估头部方向也会被下巴的检测误差带跑。68 点人脸是**专门给头部姿态**的：
+
+      * **侧轴**（眼线方向，见 :data:`coco.FACE_SIDE_PAIRS`）：眼角 / 嘴角 / 眉梢 /
+        下颌角成对平均。retarget 里 ``head`` 的 roll 参照轴就是它，所以转头、歪头都靠这一路；
+      * **上轴**（下巴 -> 眼睛，见 :data:`coco.FACE_UP_PAIRS`）：点头 / 仰头 / 歪头靠它，
+        也是 ``head`` 骨骼要瞄准的方向（老做法只用“眉毛 - 下巴”两个点）；
+      * **脸部尺度**（眼睛 -> 下巴 ≈ 11.5 cm）：把“头基座在眼线下多少”“头顶在头基座
+        上方多远”换算成像素，用来在耳朵不可用时定头基座与头顶。
+
+    返回的 ``points`` 是像素点（键名 ``face_<组名>``，另有 eye_mid / brow_mid 两个中点），
+    ``side_pairs`` / ``up_pairs`` 记的是“哪几对点算出的方向”：两种解算模式各自按自己的
+    相机模型把这些点搬到 3D 再投票 —— 每对点都有自己的真实深度，所以投票出来的方向
+    **带前后分量**（眼线的前后分量就是转头，上轴的前后分量就是点头）。
+    """
+    points: dict = {}
+    weights: dict = {}
+    for key, indexes in coco.FACE_GROUPS.items():
+        found, levels = [], []
+        for index in indexes:
+            point = _pix(keypoints, scores, index, thr)
+            if point is None:
+                continue
+            found.append(point)
+            levels.append(_confidence(scores, index))
+        if not found:
+            continue
+        points[key] = np.mean(np.stack(found, axis=0), axis=0)
+        weights[key] = sum(levels) / len(levels)
+
+    # 中点：左右两组的均值（眼线 / 上轴都要用；缺一边时对应的点对自动缺席）
+    for name, key_a, key_b in (("eye_mid", "eye_l", "eye_r"),
+                               ("brow_mid", "brow_l", "brow_r"),
+                               ("jaw_mid", "jaw_l", "jaw_r")):
+        if key_a in points and key_b in points:
+            points[name] = (points[key_a] + points[key_b]) * 0.5
+            weights[name] = min(weights.get(key_a, 0.0), weights.get(key_b, 0.0))
+
+    side_dir, side_pairs, side_consistency = _pair_direction(points, weights,
+                                                             coco.FACE_SIDE_PAIRS)
+    up_dir, up_pairs, up_consistency = _pair_direction(points, weights, coco.FACE_UP_PAIRS)
+
+    # 脸部尺度：眼睛 -> 下巴。下巴没检出来就用（眼睛 -> 嘴）反推。
+    face_len = None
+    eye_mid, mouth_mid, chin = points.get("eye_mid"), points.get("mouth_mid"), points.get("chin")
+    if eye_mid is not None and chin is not None:
+        face_len = float(np.linalg.norm(chin - eye_mid))
+    elif eye_mid is not None and mouth_mid is not None:
+        face_len = float(np.linalg.norm(eye_mid - mouth_mid)) / FACE_EYE_TO_MOUTH_RATIO
+    if face_len is not None and (not math.isfinite(face_len) or face_len < 1e-6):
+        face_len = None
+
+    # 头基座：眼线往下 0.15 个脸长（≈ 耳道口 / 上颈口的高度）
+    base = None
+    if eye_mid is not None and up_dir is not None and face_len:
+        base = eye_mid - np.asarray(up_dir, dtype=np.float64) * (
+            FACE_HEAD_BASE_BELOW_EYE * face_len)
+
+    eye_span = None
+    if "eye_l" in points and "eye_r" in points:
+        eye_span = float(np.linalg.norm(points["eye_r"] - points["eye_l"]))
+
+    return {"points": points, "weights": weights,
+            "side_dir": side_dir, "side_pairs": side_pairs, "side_consistency": side_consistency,
+            "up_dir": up_dir, "up_pairs": up_pairs, "up_consistency": up_consistency,
+            "face_len": face_len, "eye_span": eye_span, "base": base,
+            "count": len(points),
+            "reliable": bool(side_dir is not None and up_dir is not None and face_len)}
+
+
+def _ear_plausible(ears, base, face_len) -> bool:
+    """两只耳朵的中点离五官估出的头基座远不远（远 = 耳朵多半被遮挡 / 检歪了）。"""
+    if ears is None or base is None or not face_len:
+        return True
+    return float(np.linalg.norm(np.asarray(ears, dtype=float)
+                                - np.asarray(base, dtype=float))) <= FACE_EAR_TOLERANCE * face_len
+
+
+def _face_axis_3d(place, face, key: str, consistency: float = FACE_AXIS_MIN_CONSISTENCY):
+    """五官成对点在 3D 里投票出的方向（单位向量）；点不够 / 方向退化返回 None。
+
+    ``place`` 负责把 ``face_<组名>`` 的点搬到 3D（深度解算用真深度，正交模式用画面平面），
+    所以投票结果自带前后分量。几对点互相矛盾（一致度低于 ``consistency``）时把前后分量
+    丢掉：那多半是深度图在脸上给错了，宁可只保留画面内的方向（歪头照样准，转头不乱转）。
+    """
+    if not face:
+        return None
+    total = np.zeros(3, dtype=np.float64)
+    weight_sum = 0.0
+    for key_a, key_b, weight in (face.get(key) or ()):
+        point_a = place("face_%s" % key_a)
+        point_b = place("face_%s" % key_b)
+        if point_a is None or point_b is None:
+            continue
+        vector = np.asarray(point_b, dtype=np.float64) - np.asarray(point_a, dtype=np.float64)
+        span = float(np.linalg.norm(vector))
+        if span < 1e-9:
+            continue
+        current = float(weight) * span
+        total += vector / span * current
+        weight_sum += current
+    norm = float(np.linalg.norm(total))
+    if norm < 1e-9 or weight_sum <= 0.0:
+        return None
+    if norm / weight_sum < float(consistency):
+        total = np.array((total[0], 0.0, total[2]), dtype=np.float64)
+        norm = float(np.linalg.norm(total))
+        if norm < 1e-9:
+            return None
+    return total / norm
+
+
 def _collect_2d(keypoints, scores, opts) -> dict:
     """收集所需的 2D 像素点；缺失的用镜像/插值补上，并记录哪些是补出来的。"""
     thr = float(opts["score_thr"])
@@ -180,9 +361,18 @@ def _collect_2d(keypoints, scores, opts) -> dict:
 
     pts["nose"] = kp(coco.NOSE)
     pts["chin"] = kp(coco.FACE_CHIN)
-    pts["eye_a"] = kp(coco.FACE_EYE_L_END)   # 画面左侧眼角
-    pts["eye_b"] = kp(coco.FACE_EYE_R_END)   # 画面右侧眼角
     pts["brow"] = _mean([kp(i) for i in coco.FACE_BROWS])
+
+    # 五官：68 点人脸专门给头部姿态用，头 / 脖子的朝向由它投票（见 _face_frame）
+    face = _face_frame(keypoints, scores, thr)
+    for key, point in face["points"].items():
+        pts["face_%s" % key] = point
+    pts["eye_a"] = pts.get("face_eye_l")
+    if pts["eye_a"] is None:
+        pts["eye_a"] = kp(coco.FACE_EYE_L_END)     # 画面左侧眼角
+    pts["eye_b"] = pts.get("face_eye_r")
+    if pts["eye_b"] is None:
+        pts["eye_b"] = kp(coco.FACE_EYE_R_END)     # 画面右侧眼角
 
     left_base = coco.HAND_LEFT_START if not swap else coco.HAND_RIGHT_START
     right_base = coco.HAND_RIGHT_START if not swap else coco.HAND_LEFT_START
@@ -257,19 +447,41 @@ def _collect_2d(keypoints, scores, opts) -> dict:
                     pts[name] = top + np.array((0.0, max(span * 0.45, 8.0)))
             synth.add(name)
 
-    # 头部基准点（耳朵中点，退化为眼睛中点 / 鼻子）
-    ears = _mean([pts.get("ear_L"), pts.get("ear_R")])
-    if ears is None:
-        ears = _mean([pts.get("eye_L"), pts.get("eye_R")])
-    if ears is None:
-        ears = pts.get("nose")
+    # 头部基准点（头骨底 / 上颈口）：
+    #   两只耳朵的中点是最好的直接观测，但耳朵是身体分支 —— 只检出一只、或者和五官推出的
+    #   头基座差得离谱（侧头 + 头发遮挡时很常见）就不能用，否则脖子会朝错误的一侧歪。
+    #   这时改用五官估：眼线往下 0.15 ×（眼睛 -> 下巴）≈ 耳道口高度。再退到眼睛中点 /
+    #   鼻子 / 躯干外推（老做法）。
+    face_base = face.get("base")
+    ears = None
+    if pts.get("ear_L") is not None and pts.get("ear_R") is not None:
+        ears = (pts["ear_L"] + pts["ear_R"]) * 0.5
+        if not _ear_plausible(ears, face_base, face.get("face_len")):
+            ears = None
     if ears is not None:
         pts["head_base"] = ears.copy()
-    else:
-        pts["head_base"] = pts["chest"] + (pts["pelvis"] - pts["chest"]) * -0.35
+        face["head_base_source"] = "ears"
+    elif face_base is not None:
+        pts["head_base"] = np.asarray(face_base, dtype=float).copy()
         synth.add("head_base")
+        face["head_base_source"] = "face"
+    else:
+        anchor = _mean([pts.get("eye_L"), pts.get("eye_R")])
+        if anchor is None:
+            anchor = pts.get("nose")
+        if anchor is not None:
+            pts["head_base"] = anchor.copy()
+            face["head_base_source"] = "eye"
+        else:
+            pts["head_base"] = pts["chest"] + (pts["pelvis"] - pts["chest"]) * -0.35
+            synth.add("head_base")
+            face["head_base_source"] = "torso"
 
-    if pts["brow"] is not None and pts["chin"] is not None:
+    # 头顶（head 骨要瞄准的方向）：优先用五官的上轴（多对点投票），深度采样点仍落在头上
+    if face.get("up_dir") is not None and face.get("face_len"):
+        pts["head_tip"] = pts["head_base"] + np.asarray(face["up_dir"], dtype=float) * (
+            FACE_HEAD_TIP_ABOVE_BASE * float(face["face_len"]))
+    elif pts["brow"] is not None and pts["chin"] is not None:
         pts["head_tip"] = pts["brow"] + (pts["brow"] - pts["chin"]) * 0.25
     elif pts["nose"] is not None:
         base = pts["head_base"]
@@ -278,7 +490,7 @@ def _collect_2d(keypoints, scores, opts) -> dict:
         pts["head_tip"] = None
         synth.add("head_tip")
 
-    return {"points": pts, "hands": hands, "synth": synth}
+    return {"points": pts, "hands": hands, "synth": synth, "face": face}
 
 
 # --------------------------------------------------------------------------- 公共工具
@@ -404,7 +616,7 @@ def _gauss_newton(residual_fn, theta0, iterations: int = 40) -> tuple[np.ndarray
 
 # --------------------------------------------------------------------------- 骨长解算（兜底）
 def _solve_bone_lengths(pts, hands, metrics, opts, image_size, use_depth: bool,
-                        signs: dict = None) -> dict:
+                        signs: dict = None, face: dict = None) -> dict:
     """旧方式：正交投影 + 骨长约束 dz=±√(L²-d²)，符号用固定的解剖学假设。
 
     只在深度模型不可用、拟合失败或误差明显更大时使用（见 reconstruct）。
@@ -525,20 +737,25 @@ def _solve_bone_lengths(pts, hands, metrics, opts, image_size, use_depth: bool,
         joints["toe_tip.%s" % side] = ball + (toe_dir / norm if norm > 1e-9
                                               else np.array((0.0, -1.0, 0.0))) * toe_len
 
-    # 头部：脸部的“上方向”只提供平面方向，深度沿用头部基座（俯仰无法从单图判定）
+    # 头部：五官的“上轴”只提供平面内的方向，深度沿用头部基座（正交模式判定不了俯仰）
     head_len = metrics["head_len"] or 0.2
     head_xy = plane(pts["head_base"])
     head_offset = metrics.get("head_offset")
     head_y = joints["chest"][1] + (torso_offset(head_offset)[1]
                                    if head_offset is not None else 0.0)
     joints["head_base"] = np.array((head_xy[0], head_y, head_xy[1]))
-    if pts["head_tip"] is not None:
+    # 方向直接取五官投票出的上轴，而不是“头基座 -> 头顶像素”：头基座很可能取的是耳朵
+    # 中点（侧头时它会横移），拿它当起点会把头部方向带偏十几度。
+    up = _face_axis_plane(face, coco.FACE_UP_PAIRS, plane)
+    if up is not None:
+        joints["head_tip"] = joints["head_base"] + up * head_len
+    elif pts["head_tip"] is not None:
         tip_xy = plane(pts["head_tip"])
         joints["head_tip"] = np.array((tip_xy[0], joints["head_base"][1], tip_xy[1]))
     else:
         joints["head_tip"] = joints["head_base"] + np.array((0.0, 0.0, head_len))
 
-    refs = _build_refs(joints, _eye_line_from_plane(pts, plane))
+    refs = _build_refs(joints, _eye_line_from_plane(pts, face, plane))
     fingers = _build_fingers_bone(pts, hands, joints, opts, plane)
     _align_hands(joints, metrics, opts, fingers)
     return {"joints": joints, "refs": refs, "spine_points": spine_points,
@@ -546,8 +763,26 @@ def _solve_bone_lengths(pts, hands, metrics, opts, image_size, use_depth: bool,
             "mode": "BONE" if use_depth else "FLAT"}
 
 
-def _eye_line_from_plane(pts, plane):
-    """正交模式的眼线：两个眼角只取画面平面内的方向（深度沿用头部）。"""
+def _face_axis_plane(face, pairs, plane):
+    """画面平面内的五官方向（正交模式用）：点先按 ``plane`` 搬到 (x, z)，深度一律 0。"""
+    if not face:
+        return None
+    direction = _pair_direction(face.get("points") or {}, face.get("weights") or {},
+                                pairs, plane=plane)[0]
+    if direction is None:
+        return None
+    return np.array((direction[0], 0.0, direction[2]), dtype=np.float64)
+
+
+def _eye_line_from_plane(pts, face, plane):
+    """正交模式的眼线：五官投票出的侧轴只取画面平面内的方向（深度沿用头部）。
+
+    只用画面内的方向是有意的 —— 正交模式本来就没有深度，硬拿像素当“前后”会得到随机的
+    转头角度；这里能保证的是**歪头 / 侧倾**（眼线在画面内的倾斜），够用了。
+    """
+    side = _face_axis_plane(face, coco.FACE_SIDE_PAIRS, plane)
+    if side is not None:
+        return side
     if pts.get("eye_a") is None or pts.get("eye_b") is None:
         return None
     a, b = plane(pts["eye_a"]), plane(pts["eye_b"])
@@ -556,13 +791,24 @@ def _eye_line_from_plane(pts, plane):
 
 
 def _build_refs(joints, eye_line=None) -> dict:
-    """参照轴（用于 roll / 扭曲对齐）；眼线由调用方按自己的相机模型算好。"""
+    """参照轴（用于 roll / 扭曲对齐）；眼线由调用方按自己的相机模型算好。
+
+    眼线的符号要**统一到肩线**：五官给出的眼线是“画面左 -> 画面右”，人物背对镜头时它
+    正好和身体的左右反着，而 retarget 里静止侧的参照轴（rigify_map 的 eye_line）用的是
+    “人物右 -> 人物左”。不统一的话背对镜头的照片会把头拧 180°。
+    """
+    shoulder_line = joints["shoulder.L"] - joints["shoulder.R"]
     refs = {"hip_line": joints["hip.L"] - joints["hip.R"],
-            "shoulder_line": joints["shoulder.L"] - joints["shoulder.R"]}
-    if eye_line is None or float(np.linalg.norm(eye_line)) <= 1e-6:
-        refs["eye_line"] = refs["shoulder_line"]
+            "shoulder_line": shoulder_line}
+    eye = None
+    if eye_line is not None:
+        eye = np.asarray(eye_line, dtype=float)
+        if float(np.dot(eye, shoulder_line)) < 0.0:
+            eye = -eye
+    if eye is None or float(np.linalg.norm(eye)) <= 1e-6:
+        refs["eye_line"] = shoulder_line
     else:
-        refs["eye_line"] = np.asarray(eye_line, dtype=float)
+        refs["eye_line"] = eye
 
     for side in ("L", "R"):
         upper_arm = joints["elbow.%s" % side] - joints["shoulder.%s" % side]
@@ -849,7 +1095,7 @@ def _repair_depths(joints, pixels, segments, signs, cx: float, cy: float,
     return len(repaired)
 
 
-def _solve_depth(pts, hands, metrics, opts, image_size, depth_map, depth_size):
+def _solve_depth(pts, hands, metrics, opts, image_size, depth_map, depth_size, face=None):
     """深度模型驱动的解算：每个关节的深度直接来自深度图。
 
     未知量只有两个**全局**参数：(α, β)。α 是“归一化相对深度 -> 米”的缩放（带符号，
@@ -876,6 +1122,11 @@ def _solve_depth(pts, hands, metrics, opts, image_size, depth_map, depth_size):
                  "wr_L", "wr_R", "kn_L", "kn_R", "an_L", "an_R", "big_L", "big_R",
                  "head_base", "head_tip", "eye_a", "eye_b"):
         sample_list.append((name, pts.get(name)))
+    # 五官点组：头 / 脖子的朝向靠它们投票（每一对点都有自己的真实深度，见 _face_axis_3d）。
+    # 它们不参与骨长拟合（不在 constraints 里），所以只是多几次深度采样。
+    for name, point in pts.items():
+        if name.startswith("face_") and point is not None:
+            sample_list.append((name, point))
     for side in ("L", "R"):
         sample_list.append(("mcp_%s" % side, hands[side].get(coco.HAND_MIDDLE_MCP)))
         if opts.get("fingers"):
@@ -1064,18 +1315,20 @@ def _solve_depth(pts, hands, metrics, opts, image_size, depth_map, depth_size):
         head_base = joints["chest"] + (torso_offset(head_offset)
                                        if head_offset is not None else 0.0)
     joints["head_base"] = np.asarray(head_base, dtype=float)
-    head_tip = place("head_tip")
-    joints["head_tip"] = (np.asarray(head_tip, dtype=float) if head_tip is not None
-                          else joints["head_base"] + np.array((0.0, 0.0, head_len)))
+    # 头部方向：五官的上轴（下巴 -> 眼睛 / 眉毛 / 嘴角，各自带自己的真实深度）。
+    # 老做法是采“额头上方那个像素”的深度：那一点常常落在头发 / 背景上，头部方向（尤其
+    # 俯仰）会被它带跑；改用好几对脸上的点投票之后，点头 / 仰头都有真实的前后分量。
+    up_axis = _face_axis_3d(place, face, "up_pairs")
+    if up_axis is not None:
+        joints["head_tip"] = joints["head_base"] + up_axis * head_len
+    else:
+        head_tip = place("head_tip")
+        joints["head_tip"] = (np.asarray(head_tip, dtype=float) if head_tip is not None
+                              else joints["head_base"] + np.array((0.0, 0.0, head_len)))
 
-    # 眼线用两个眼角的真实深度算，比只取平面方向更准
-    eye_a, eye_b = place("eye_a"), place("eye_b")
-    eye_line = None
-    if eye_a is not None and eye_b is not None:
-        candidate = np.asarray(eye_b, dtype=float) - np.asarray(eye_a, dtype=float)
-        if float(np.linalg.norm(candidate)) > 1e-6:
-            eye_line = candidate
-    refs = _build_refs(joints, eye_line)
+    # 眼线（head 的 roll 参照轴）：成对五官各自带真实深度一起投票 —— 画面内的分量是歪头，
+    # 前后分量就是**转头**，这正是单张图里最难拿、也最容易被两个眼角的一两次采样带偏的东西
+    refs = _build_refs(joints, _face_axis_3d(place, face, "side_pairs"))
     fingers = _build_fingers_depth(opts, place)
     _align_hands(joints, metrics, opts, fingers)   # 最后一步：手（含手指）顺着小臂
     return {"joints": joints, "refs": refs, "spine_points": spine_points,
@@ -1118,6 +1371,7 @@ def reconstruct(keypoints, scores, metrics, image_size, options=None,
     pts = collected["points"]
     hands = collected["hands"]
     synth = collected["synth"]
+    face = collected.get("face") or {}
 
     mode = str(opts.get("depth_mode", "DEPTH")).upper()
     if mode not in DEPTH_MODES:
@@ -1126,13 +1380,18 @@ def reconstruct(keypoints, scores, metrics, image_size, options=None,
     notes: list[str] = []
     solved = None
     rejected_depth = None
+    # 头基座 / 脖子方向换了来源就说一声：面板上能直接看出用的是耳朵还是五官
+    if face.get("head_base_source") == "face":
+        notes.append("头基座 / 脖子方向改用五官估（耳朵只检出一只或和五官对不上）")
+    elif face.get("head_base_source") in ("eye", "torso"):
+        notes.append("没有可用的耳朵与五官，头基座按旧方式外推")
 
     if mode == "DEPTH":
         if depth_map is None or depth_size is None:
             notes.append("没有深度图，已退回骨长解算")
         else:
             solved = _solve_depth(pts, hands, metrics, opts, image_size,
-                                  depth_map, depth_size)
+                                  depth_map, depth_size, face=face)
             if solved is None:
                 notes.append("深度解算失败，已退回骨长解算")
             else:
@@ -1140,7 +1399,7 @@ def reconstruct(keypoints, scores, metrics, image_size, options=None,
                 # 的残差（回修之后每段都刚好是骨架骨长，拿来判“深度图可不可信”就没意义了）
                 signs = solved["depth"].get("signs") or None
                 fallback = _solve_bone_lengths(pts, hands, metrics, opts, image_size,
-                                               use_depth=True, signs=signs)
+                                               use_depth=True, signs=signs, face=face)
                 depth_error = float(solved["depth"]["bone_error"])
                 fallback_error = _bone_error_rms(fallback["joints"], constraints)
                 solved["depth"]["bone_error_fallback"] = fallback_error
@@ -1151,7 +1410,7 @@ def reconstruct(keypoints, scores, metrics, image_size, options=None,
                     solved = fallback
     if solved is None:
         solved = _solve_bone_lengths(pts, hands, metrics, opts, image_size,
-                                     use_depth=(mode != "FLAT"))
+                                     use_depth=(mode != "FLAT"), face=face)
 
     joints = solved["joints"]
     refs = solved["refs"]

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pose_capture"
-version = "1.3.2"
+version = "1.3.3"
 name = "Pose Capture (DWPose to Rigify)"
 tagline = "读取图片，用 DWPose + 深度模型识别人体骨架并转换成 Rigify 骨骼的 Pose"
 maintainer = "Pose Capture"

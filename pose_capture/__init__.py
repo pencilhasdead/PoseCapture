@@ -6,7 +6,7 @@
 bl_info = {
     "name": "Pose Capture (DWPose to Rigify)",
     "author": "Pose Capture",
-    "version": (1, 3, 2),
+    "version": (1, 3, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Pose Capture",
     "description": "读取图片，用 DWPose + 深度模型识别人体骨架，并写入 Rigify 标准骨骼的 Pose",

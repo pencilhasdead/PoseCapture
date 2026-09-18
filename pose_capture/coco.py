@@ -105,6 +105,65 @@ FACE_NOSE_TIP = FACE_START + 30
 FACE_BROWS = list(range(FACE_START + 17, FACE_START + 27))
 FACE_ALL = list(range(FACE_START, FACE_START + FACE_COUNT))
 
+# 五官分组（iBUG 300W / dlib 布局）：头 / 脖子的朝向由这些点投票出来，见 FACE_SIDE_PAIRS /
+# FACE_UP_PAIRS。名字里的 l / r 都是**画面**左右，与 FACE_EYE_L_END 的注释同一套约定
+# （画面左侧 = 人物的右侧）—— 所以成对使用时的方向是“画面左 -> 画面右”，它是不是人物的
+# “右 -> 左”取决于人物朝向，reconstruction 里会按肩线把符号统一过来。
+FACE_EYE_L = list(range(FACE_START + 36, FACE_START + 42))    # 画面左侧眼睛（人物右眼）
+FACE_EYE_R = list(range(FACE_START + 42, FACE_START + 48))    # 画面右侧眼睛（人物左眼）
+FACE_BROW_R = list(range(FACE_START + 17, FACE_START + 22))   # 画面右侧眉毛
+FACE_BROW_L = list(range(FACE_START + 22, FACE_START + 27))   # 画面左侧眉毛
+FACE_NOSE_BRIDGE = list(range(FACE_START + 27, FACE_START + 31))
+FACE_NOSE_BOTTOM = list(range(FACE_START + 31, FACE_START + 36))
+FACE_MOUTH_OUTER = list(range(FACE_START + 48, FACE_START + 60))
+FACE_MOUTH_INNER = list(range(FACE_START + 60, FACE_START + 68))
+FACE_MOUTH = FACE_MOUTH_OUTER + FACE_MOUTH_INNER
+
+# 五官点组（键名 -> 68 点里的索引；长度 1 就是单个点）。eye_mid / brow_mid 不在表里 ——
+# 它们是 eye_l/eye_r、brow_l/brow_r 的中点，由 reconstruction._face_frame 现算。
+FACE_GROUPS = {
+    "chin": (FACE_CHIN,),
+    "nose_bridge": tuple(FACE_NOSE_BRIDGE),
+    "nose_bottom": tuple(FACE_NOSE_BOTTOM),
+    "nose_tip": (FACE_NOSE_TIP,),
+    "eye_l": tuple(FACE_EYE_L),
+    "eye_r": tuple(FACE_EYE_R),
+    "eye_l_inner": (FACE_START + 39,),
+    "eye_r_inner": (FACE_START + 42,),
+    "eye_l_outer": (FACE_EYE_L_END,),
+    "eye_r_outer": (FACE_EYE_R_END,),
+    "brow_l": tuple(FACE_BROW_L),
+    "brow_r": tuple(FACE_BROW_R),
+    "mouth_l": (FACE_START + 48,),
+    "mouth_r": (FACE_START + 54,),
+    "mouth_mid": tuple(FACE_MOUTH),
+    "jaw_l": (FACE_START + 0,),
+    "jaw_r": (FACE_START + 16,),
+}
+
+# 头部“侧轴”（眼线 / 左右方向）用的成对点：画面左 -> 画面右。权重 = 解剖上的可信度：
+# 眼角最准（侧头时也还在脸上），眉梢还行，下颌角最次（它其实落在耳前，会被发型 / 侧头带跑）。
+# 成对平均而不是只用两个外眼角：单点抖动（睫毛、嘴角）不会把 roll / 转头整体带歪。
+FACE_SIDE_PAIRS = (
+    ("eye_l_outer", "eye_r_outer", 1.0),
+    ("eye_l", "eye_r", 1.0),
+    ("eye_l_inner", "eye_r_inner", 0.9),
+    ("mouth_l", "mouth_r", 0.8),
+    ("brow_l", "brow_r", 0.6),
+    ("jaw_l", "jaw_r", 0.4),
+)
+
+# 头部“上轴”（下巴 -> 头顶）用的成对点（下 -> 上）：下巴 -> 眼睛最长也最稳（成人 ≈ 11.5 cm），
+# 其余几对用来投票降噪，顺便在没有下巴时也能给出方向。
+FACE_UP_PAIRS = (
+    ("chin", "eye_mid", 1.0),
+    ("chin", "brow_mid", 0.9),
+    ("mouth_mid", "eye_mid", 0.8),
+    ("nose_tip", "brow_mid", 0.6),
+    ("nose_bottom", "eye_mid", 0.5),
+)
+
+
 # 手指分组（相对手部 21 点局部索引）
 HAND_GROUPS = {
     "thumb": [1, 2, 3, 4],
