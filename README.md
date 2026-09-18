@@ -20,7 +20,7 @@
 python build_zip.py          # 生成 dist/ 下的两个 zip
 ```
 
-### 方式 A：常规安装（最简单，实测通过）
+### 方式 A：常规安装（最简单，实测通过）  
 
 * Blender → `编辑` → `偏好设置` → `附加组件` → 右上角 `▾` → `从磁盘安装…`
 * 选择 `dist/pose_capture-1.3.3-legacy.zip`
