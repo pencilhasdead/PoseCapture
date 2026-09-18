@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "pose_capture"
+version = "1.0.1"
+name = "Pose Capture (DWPose to Rigify)"
+tagline = "读取图片，用 DWPose 识别人体骨架并转换成 Rigify 骨骼的 Pose"
+maintainer = "Pose Capture"
+type = "add-on"
+
+tags = ["Animation", "Rigging"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+network = "首次使用时下载 DWPose 模型（yolox_l.onnx / dw-ll_ucoco_384.onnx）与安装推理依赖"
+files = "读写插件数据目录（模型、pip 依赖），以及读取用户选择的图片"

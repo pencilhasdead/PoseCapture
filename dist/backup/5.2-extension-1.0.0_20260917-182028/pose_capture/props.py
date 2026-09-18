@@ -1,0 +1,235 @@
+"""插件的场景属性与偏好设置。"""
+from __future__ import annotations
+
+import os
+
+import bpy
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty,
+                       IntProperty, PointerProperty, StringProperty)
+from bpy.types import AddonPreferences, PropertyGroup
+
+from . import deps, reconstruction, rigify_map, utils
+
+
+class PC_BoneMapping(PropertyGroup):
+    """一行“角色 -> 骨骼”的映射。"""
+
+    role: StringProperty(name="角色")
+    label: StringProperty(name="说明")
+    bone: StringProperty(name="骨骼")
+
+
+class PC_Settings(PropertyGroup):
+    # ---------------- 输入 ----------------
+    image_source: EnumProperty(
+        name="图片来源",
+        items=[("FILE", "图片文件", "从磁盘选择一张图片"),
+               ("DATA", "已加载图像", "使用 Blender 里已经加载的图像数据块")],
+        default="FILE")
+    image_filepath: StringProperty(name="图片", subtype="FILE_PATH", default="")
+    image_name: StringProperty(name="图像", default="")
+    person_index: IntProperty(name="人物序号", default=0, min=0, max=32,
+                              description="画面中有多人时选择第几个（0 = 面积最大的人）")
+
+    # ---------------- 目标 ----------------
+    armature: PointerProperty(
+        name="目标骨架", type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == "ARMATURE")
+    bone_map: CollectionProperty(type=PC_BoneMapping)
+    bone_map_index: IntProperty(default=0)
+    map_ready: BoolProperty(default=False)
+    auto_map_on_apply: BoolProperty(name="自动匹配骨骼名", default=True)
+
+    # ---------------- 检测参数 ----------------
+    score_thr: FloatProperty(name="关键点置信度阈值", default=0.3, min=0.05, max=1.0)
+    det_thr: FloatProperty(name="人体框置信度阈值", default=0.3, min=0.05, max=1.0)
+
+    # ---------------- 姿态解算参数 ----------------
+    facing: EnumProperty(
+        name="人物朝向",
+        items=[(key, reconstruction.FACING_LABELS[key], "")
+               for key in reconstruction.FACING_DIRS],
+        default="FRONT")
+    use_depth: BoolProperty(name="用骨长约束解算深度", default=True,
+                            description="关闭后姿态会完全压在画面平面内")
+    elbow_back: BoolProperty(name="手肘向后弯", default=True,
+                             description="深度符号启发式：手臂前后被遮挡时，肘部朝角色背后")
+    knee_front: BoolProperty(name="膝盖向前弯", default=True,
+                             description="深度符号启发式：膝盖朝角色前方弯曲")
+    spine_lean_front: BoolProperty(name="躯干前倾朝前", default=True)
+    swap_lr: BoolProperty(name="交换左右", default=False,
+                          description="检测把人物左右判反时才需要勾选")
+    twist: BoolProperty(name="估算骨骼扭转(roll)", default=True,
+                        description="用肩线/胯线/弯曲轴对齐骨骼轴向，避免手臂头部拧转")
+    twist_blend: FloatProperty(name="扭转强度", default=1.0, min=0.0, max=1.0)
+    scale_hint: FloatProperty(name="比例微调", default=1.0, min=0.5, max=2.0,
+                              description="轻微调整“关键点像素 / 骨架米”的比例（一般不用改）")
+    fingers: BoolProperty(name="写入手指", default=False,
+                          description="需要手指关键点质量较好时才开启")
+    root_motion: BoolProperty(name="写入根骨骼位移", default=False,
+                              description="把人物的水平位置/站立高度写到 root 骨骼")
+    ground_align: BoolProperty(name="落地对齐", default=True)
+    fk_mode: BoolProperty(name="自动切到 FK 模式", default=True,
+                          description="Rigify 生成骨架默认 IK，写 FK 旋转前把 IK_FK 滑块设为 0")
+    keyframe: BoolProperty(name="插入关键帧", default=False)
+
+    # ---------------- 状态 ----------------
+    status: StringProperty(name="状态", default="")
+    log: StringProperty(name="日志", default="")
+    detected: BoolProperty(default=False)
+    preview_name: StringProperty(default="")
+    detect_info: StringProperty(default="")
+
+
+class PC_Preferences(AddonPreferences):
+    bl_idname = __package__
+
+    backend: EnumProperty(
+        name="推理后端",
+        items=[("auto", "自动（onnxruntime 优先）", ""),
+               ("onnxruntime", "onnxruntime", ""),
+               ("opencv", "OpenCV DNN", "")],
+        default="auto")
+    backend_package: EnumProperty(
+        name="要安装的依赖包",
+        items=[(name, name, "") for name in deps.BACKEND_PACKAGE_IDS],
+        default="onnxruntime")
+    device: EnumProperty(
+        name="推理设备",
+        items=[("auto", "自动", "按可用 provider 自动选择"),
+               ("cpu", "CPU", ""),
+               ("dml", "DirectML", ""),
+               ("cuda", "CUDA", "")],
+        default="auto")
+    local_dwpose_root: StringProperty(
+        name="本地模型目录（可选）", subtype="DIR_PATH", default="",
+        description="已下载过 DWPose/Easy-DWPose 模型的目录，插件会递归查找 onnx 文件")
+    auto_install: BoolProperty(name="缺少依赖时自动安装", default=True)
+    verbose: BoolProperty(name="输出详细日志", default=True)
+
+    def draw(self, context):
+        layout = self.layout
+        status = deps.backend_status()
+
+        box = layout.box()
+        box.label(text="依赖状态", icon="INFO")
+        row = box.row()
+        row.label(text="onnxruntime: %s" % (status["onnxruntime"] or "未安装"))
+        row.label(text="opencv: %s" % (status["opencv"] or "未安装"))
+        if status.get("providers"):
+            box.label(text="可用 provider: %s" % ", ".join(status["providers"]))
+        box.label(text="依赖目录: %s" % utils.libs_dir())
+        box.label(text="模型目录: %s" % utils.models_dir())
+        box.label(text="自带 Python: %s" % (utils.python_executable() or "未找到"))
+
+        row = layout.row(align=True)
+        row.prop(self, "backend")
+        row.prop(self, "device")
+        row = layout.row(align=True)
+        row.prop(self, "backend_package", text="")
+        row.operator("pose_capture.install_deps", text="安装/更新依赖", icon="IMPORT")
+        layout.prop(self, "auto_install")
+        layout.prop(self, "verbose")
+
+        box = layout.box()
+        box.label(text="模型来源", icon="FILE_FOLDER")
+        box.prop(self, "local_dwpose_root")
+        row = box.row(align=True)
+        row.operator("pose_capture.import_local_models", text="从本地目录导入")
+        row.operator("pose_capture.download_models", text="在线下载模型")
+
+
+# --------------------------------------------------------------------------- 工具函数
+def get_settings(context=None) -> PC_Settings:
+    context = context or bpy.context
+    return context.scene.pose_capture
+
+
+def get_prefs(context=None) -> PC_Preferences:
+    context = context or bpy.context
+    addon = context.preferences.addons.get(__package__)
+    if addon is not None and addon.preferences is not None:
+        return addon.preferences
+    return context.preferences.addons[__package__].preferences
+
+
+def ensure_mapping_rows(settings: PC_Settings) -> None:
+    """保证映射表里有全部角色行（不覆盖用户已有设置）。"""
+    existing = {row.role for row in settings.bone_map}
+    for role in rigify_map.all_role_ids(include_fingers=True):
+        if role in existing:
+            continue
+        row = settings.bone_map.add()
+        row.role = role
+        row.label = rigify_map.role_label(role)
+
+
+def mapping_from_settings(settings: PC_Settings) -> rigify_map.BoneMap:
+    bmap = rigify_map.BoneMap()
+    for row in settings.bone_map:
+        if row.bone:
+            bmap.set(row.role, row.bone)
+    return bmap
+
+
+def sync_mapping_to_settings(settings: PC_Settings, bmap: rigify_map.BoneMap) -> None:
+    ensure_mapping_rows(settings)
+    for row in settings.bone_map:
+        row.bone = bmap.get(row.role) or ""
+    settings.map_ready = True
+
+
+def options_from_settings(settings: PC_Settings) -> dict:
+    return {
+        "score_thr": settings.score_thr,
+        "facing": settings.facing,
+        "use_depth": settings.use_depth,
+        "elbow_back": settings.elbow_back,
+        "knee_front": settings.knee_front,
+        "spine_lean_front": settings.spine_lean_front,
+        "swap_lr": settings.swap_lr,
+        "fingers": settings.fingers,
+        "twist": settings.twist,
+        "twist_blend": settings.twist_blend,
+        "scale_hint": settings.scale_hint,
+        "root_motion": settings.root_motion,
+        "ground_align": settings.ground_align,
+        "keep_depth": True,
+        "fk_mode": settings.fk_mode,
+        "keyframe": settings.keyframe,
+    }
+
+
+def resolve_model_paths() -> tuple[str, str, bool]:
+    """返回 (检测模型, 姿态模型, 是否都已就绪)。"""
+    prefs = get_prefs()
+    det, pose = deps.model_paths()
+
+    override = getattr(prefs, "local_dwpose_root", "")
+    if override and (not os.path.isfile(det) or not os.path.isfile(pose)):
+        found = deps.find_local_models(override)
+        if found:
+            det, pose = found
+
+    ready = os.path.isfile(det) and os.path.isfile(pose)
+    return det, pose, ready
+
+
+def resolve_providers():
+    prefs = get_prefs()
+    mapping = {"cpu": ["CPUExecutionProvider"],
+               "dml": ["DmlExecutionProvider"],
+               "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"]}
+    device = getattr(prefs, "device", "auto")
+    providers = mapping.get(device)
+    if device == "auto" or providers is None:
+        return None
+    try:
+        import onnxruntime as ort
+
+        available = ort.get_available_providers()
+        filtered = [name for name in providers if name in available]
+        return filtered or None
+    except Exception:  # noqa: BLE001
+        return None
+
