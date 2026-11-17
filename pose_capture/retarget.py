@@ -138,8 +138,14 @@ def solve_role_matrix(role: str, target, refs: dict, rest_refs: dict, rest_mat3:
 
 
 # IK 直写结果的核对阈值：超过就退回“切 FK + Rigify 快照”的老路径。
-IK_DIRECT_POS_TOL = 0.02     # 米
+IK_DIRECT_POS_TOL = 0.02     # 米（直写那一下的核对）
 IK_DIRECT_ANGLE_TOL = 10.0   # 度
+
+# 全部写完之后的**最终复核**阈值（更严）：直写套完以后，关节还会被 IK 的 stretch / 极点
+# 再解一次 —— 实测直写核对 11 mm 的腿，最终膝盖能差到 20 mm。Rigify 自己的快照也会差几毫米
+# （膝盖最明显，那是 IK 链的 hinge / stretch 带来的，方向一致），所以这里按关节位置卡 8 mm。
+IK_FINAL_POS_TOL = 0.008     # 米
+IK_FINAL_ANGLE_TOL = 4.0     # 度
 
 
 # --------------------------------------------------------------------------- 应用姿态
@@ -147,11 +153,26 @@ def limb_mode_option(options: dict) -> str:
     """这次写完后要停在 IK（Rigify 默认控制器）还是 FK。
 
     兼容旧键 ``fk_mode``：历史上 True 表示“自动切到 FK 模式”。
+    注意：``limb_mode`` 还有 ``IK_LEG`` / ``FK_LEG`` 这种“按种类拆开”的组合值，
+    那时这个函数返回全局默认（IK），逐条肢体请用 :func:`limb_mode_for`。
     """
     mode = str(options.get("limb_mode") or "").upper()
     if mode in rigify_limbs.MODES:
         return mode
     return rigify_limbs.MODE_FK if options.get("fk_mode") else rigify_limbs.MODE_IK
+
+
+def limb_mode_for(kind: str, options: dict) -> str:
+    """某条肢体（``spec["kind"]``：``Arm`` / ``Leg``）这次要写成 IK 还是 FK。
+
+    ``options["limb_mode"]`` 可以是 ``IK`` / ``FK``，也可以是按种类拆开的
+    ``IK_LEG``（腿 IK + 臂 FK）/ ``FK_LEG``（腿 FK + 臂 IK）。
+    """
+    mode = str((options or {}).get("limb_mode") or "").upper()
+    if mode not in rigify_limbs.LIMB_MODE_COMBOS:
+        # 老配置（只有 IK / FK，或者只有 fk_mode）：按全局那个值走
+        return limb_mode_option(options or {})
+    return rigify_limbs.mode_for_kind(kind, mode)
 
 
 def _limb_bone_names(spec: dict) -> set:
@@ -176,12 +197,16 @@ def _limbs_written(written_names, specs: dict) -> dict:
     return out
 
 
-def _limb_keyframe_bones(limbs: dict, mode: str) -> list[str]:
-    """IK 模式下要一起打帧的 IK 控制器（可见的那几个，不含 MCH-）。"""
-    if mode != rigify_limbs.MODE_IK:
-        return []
+def _limb_keyframe_bones(limbs: dict, mode) -> list[str]:
+    """IK 模式下要一起打帧的 IK 控制器（可见的那几个，不含 MCH-）。
+
+    ``mode`` 可以是 ``"IK"`` / ``"FK"``，也可以是 ``{肢体 key: 模式}``（按种类拆开写入时）。
+    """
     out: list[str] = []
-    for spec in (limbs or {}).values():
+    for key, spec in (limbs or {}).items():
+        limb_mode = mode.get(key, rigify_limbs.MODE_IK) if isinstance(mode, dict) else mode
+        if limb_mode != rigify_limbs.MODE_IK:
+            continue
         for name in spec["ctrl_bones"] + spec["tail_bones"] + spec["extra_ctrls"]:
             if name not in out:
                 out.append(name)
@@ -189,56 +214,89 @@ def _limb_keyframe_bones(limbs: dict, mode: str) -> list[str]:
 
 
 def close_limbs(arm_obj, limbs: dict, mode: str, report: dict, options: dict,
-                specs: dict = None, direct: dict = None) -> None:
-    """收尾：IK 模式下把（没能直写的）IK 控制器对齐到 FK 姿态，再按模式同步控制器显示。
+                specs: dict = None, direct: dict = None) -> dict:
+    """收尾：IK 模式下把（没能直写的）IK 控制器对齐到姿态，再按模式同步控制器显示。
 
     * ``direct``：已经**直接**把姿态写进 IK 控制器的肢体 —— 它们不切 FK、不做快照；
-    * 其余肢体在 IK 模式仍走老路径：切 FK -> Rigify 的 “IK->FK” 快照 -> 回到 IK；
-    * FK 模式不用快照 —— 姿态本来就停在 FK 骨骼上。
+    * 其余肢体在 IK 模式走 Rigify 的 “IK->FK” 快照（关节位置与 FK 差几毫米以内，膝盖最明显
+      —— 那是 IK 链的 hinge / stretch，方向与 FK 一致）；
+    * ``options["ik_fallback"] == "FK"``（面板上的“直写没成功时”）时不做快照，直接停在
+      FK —— 姿态就是 FK 链上那份（一样精确），只是控制器换成 FK 那组；
+    * **快照失败**（Rigify 生成的脚本被删 / 操作符报错）的肢体也停在 FK：以前会切回 IK，
+      把姿态藏在 IK 控制器后面，看起来像“点了没生效”。
+
+    返回 ``{肢体 key: 最终模式}`` —— 调用方用它决定关键帧要覆盖哪些 IK 控制器。
     """
+    out: dict = {}
     if not limbs:
         # 只有“是 Rigify 生成骨架但连一条 IK 链都找不到”才值得提示
         if mode == rigify_limbs.MODE_IK and not (specs or {}):
             if rigify_limbs.rig_id(arm_obj):
                 report["warnings"].append("骨架里找不到 Rigify 的 IK 控制器链，按普通 FK 写入")
-        return
+        return out
 
     report["limb_mode"] = mode
+    stay_fk: dict = {}
     if mode == rigify_limbs.MODE_IK:
-        snap = {key: spec for key, spec in limbs.items() if key not in (direct or {})}
-        if snap:
-            # Rigify 的快照要求“FK 链上的姿态就是当前姿态”，所以先切 FK、快照完再切回来。
-            rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_FK, report, snap, sync=False)
-            view_layer = bpy.context.view_layer
-            if view_layer is not None:
-                view_layer.update()
-            snapped = rigify_limbs.snap_limbs(arm_obj, snap, report)
-            report["ik_snapped"] = snapped
-            missing = [spec["fk_bones"][0] for key, spec in snap.items()
-                       if key not in snapped]
-            if missing:
-                report["warnings"].append("这些肢体没做上 IK 快照：%s" % ", ".join(missing))
-        rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_IK, report, limbs, sync=False)
+        pending = {key: spec for key, spec in limbs.items() if key not in (direct or {})}
+        if pending:
+            fallback = str(options.get("ik_fallback") or "SNAP").upper()
+            if fallback == "FK":
+                stay_fk.update(pending)
+            else:
+                # Rigify 的快照要求“FK 链上的姿态就是当前姿态”，所以先切 FK、快照完再切回来。
+                rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_FK, report, pending, sync=False)
+                _update_view()
+                snapped = rigify_limbs.snap_limbs(arm_obj, pending, report)
+                report["ik_snapped"] = sorted(set(report.get("ik_snapped") or []) | set(snapped))
+                missing = {key: spec for key, spec in pending.items() if key not in snapped}
+                if missing:
+                    stay_fk.update(missing)
+                    report["warnings"].append(
+                        "这些肢体没做上 IK 快照，已停在 FK：%s"
+                        % ", ".join(sorted(spec["fk_bones"][0] for spec in missing.values())))
+        if stay_fk:
+            rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_FK, report, stay_fk, sync=False)
+            report["fk_switched"] = sorted(set(report.get("fk_switched") or [])
+                                           | {spec["prop_bone"] for spec in stay_fk.values()})
+        keep_ik = {key: spec for key, spec in limbs.items() if key not in stay_fk}
+        if keep_ik:
+            rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_IK, report, keep_ik, sync=False)
+        for key in limbs:
+            out[key] = rigify_limbs.MODE_FK if key in stay_fk else rigify_limbs.MODE_IK
+        if stay_fk and str(options.get("ik_fallback") or "SNAP").upper() == "FK":
+            report["warnings"].append(
+                "这些肢体按“直写没成功时 = 停在 FK”留在 FK：%s"
+                % ", ".join(sorted(spec["fk_bones"][0] for spec in stay_fk.values())))
     else:
-        report["fk_switched"] = sorted(spec["prop_bone"] for spec in limbs.values())
+        report["fk_switched"] = sorted(set(report.get("fk_switched") or [])
+                                       | {spec["prop_bone"] for spec in limbs.values()})
+        out = {key: rigify_limbs.MODE_FK for key in limbs}
 
+    report.setdefault("limb_modes", {}).update(out)
+    # 刚改过 IK_FK：让依赖图把 DEF-* 按新模式算一遍，否则读取位置 / 图片预览会拿到上一帧的结果
+    _settle_view()
     if bool(options.get("sync_visibility", True)):
         touched = rigify_limbs.sync_visibility(arm_obj)
         if touched:
             report["visibility"] = touched
+    return out
 
 
 # --------------------------------------------------------------------------- IK 直写
-def direct_limb_plans(bmap, limbs: dict) -> dict:
+def direct_limb_plans(bmap, limbs: dict, mode_of=None) -> dict:
     """挑出这次“可以直写 IK 控制器”的肢体：``key -> {"spec", "plan"}``。
 
-    两个条件：
-      1. 用户的映射确实指向这条肢体的 IK 控制器（IK 模式下的自动匹配就是这么映射的；
+    三个条件：
+      1. 这条肢体这次要写成 IK（``mode_of(key, spec)``，不传就是全都要）；
+      2. 用户的映射确实指向这条肢体的 IK 控制器（IK 模式下的自动匹配就是这么映射的；
          手动把肢体映射成 FK 骨骼的话我们也不越权改别的骨骼）；
-      2. Rigify 的链信息里认得出一根可写的控制器（链根 / 末端）和 IK 目标骨。
+      3. Rigify 的链信息里认得出一根可写的控制器（链根 / 末端）和 IK 目标骨。
     """
     out: dict = {}
     for key, spec in (limbs or {}).items():
+        if mode_of is not None and mode_of(key, spec) != rigify_limbs.MODE_IK:
+            continue
         plan = rigify_limbs.ik_write_plan(spec)
         if not plan:
             continue
@@ -253,6 +311,21 @@ def _update_view() -> None:
     view_layer = bpy.context.view_layer
     if view_layer is not None:
         view_layer.update()
+
+
+def _settle_view() -> None:
+    """把依赖图推到“稳定”：改完 ``IK_FK`` 之后读到的 ``DEF-*`` 才是新的。
+
+    改 ``IK_FK`` 只改了驱动值：要先让驱动求出约束影响，再算骨头位置，一次 ``update()`` 不够
+    （实测“停在 FK”时膝盖仍差 37 mm，再推一次才归零）。``evaluated_depsgraph_get()`` 会强制
+    求值一遍，比单纯 ``view_layer.update()`` 稳。
+    """
+    _update_view()
+    try:
+        bpy.context.evaluated_depsgraph_get().update()
+    except Exception:  # noqa: BLE001  后台 / 无窗口环境下拿不到时忽略
+        pass
+    _update_view()
 
 
 def _write_limb_fk_chain(arm_obj, plan: dict, targets: dict, refs: dict, metrics: dict,
@@ -305,11 +378,59 @@ def _limb_check_score(arm_obj, spec: dict, roles) -> float:
             + math.radians(check[1]) / math.radians(IK_DIRECT_ANGLE_TOL))
 
 
-def _search_root_roll(arm_obj, spec: dict, plan: dict, steps: int = 16, rounds: int = 5) -> bool:
+def _ik_check_passed(check) -> bool:
+    """直写结果够不够进“直写成功”的名单（``check`` = (位置差 m, 方向差 度)）。"""
+    return (check is not None and check[0] <= IK_DIRECT_POS_TOL
+            and check[1] <= IK_DIRECT_ANGLE_TOL)
+
+
+def _ik_final_ok(check) -> bool:
+    """最终复核：写完全部肢体之后，这条肢体的偏差还能不能接受。"""
+    return (check is not None and check[0] <= IK_FINAL_POS_TOL
+            and check[1] <= IK_FINAL_ANGLE_TOL)
+
+
+def verify_ik_direct(arm_obj, plans: dict, report: dict, specs: dict = None) -> dict:
+    """复核直写结果：按**全部写完之后的实际** DEF 骨位置再量一遍，超标的退回快照。
+
+    为什么要再量一遍：直写是把 Rigify 那套“世界增量”直接套到控制器上，没有跑它内部的
+    ``correct_rotation``；同样的姿态，IK 链的 stretch / 极点之后还会把关节再解一次。实测
+    直写时核对 11 mm 的腿，最终膝盖能差到 20 mm。所以这里按最终状态再卡一次
+    （``IK_FINAL_POS_TOL`` / ``IK_FINAL_ANGLE_TOL``），超标的肢体从“直写名单”里拿掉，
+    调用方会用 Rigify 的快照 / FK 重新收尾。
+
+    返回仍然是“直写”的肢体（``{肢体 key: spec}``，跟 :func:`apply_ik_direct` 的返回一致）；
+    ``report["ik_direct"]`` / ``ik_direct_error`` 会跟着更新。
+    """
+    keep: dict = {}
+    errors: dict = {}
+    dropped: list[str] = []
+    for key, spec in (plans or {}).items():
+        plan = rigify_limbs.ik_write_plan(spec) or {}
+        check = _ik_direct_check(arm_obj, spec, plan.get("roles"))
+        name = spec["fk_bones"][0]
+        if check is not None:
+            errors[name] = [round(float(check[0]), 4), round(float(check[1]), 2)]
+        if not _ik_final_ok(check):
+            dropped.append("%s（%s）" % (name, "没法核对" if check is None
+                                         else "偏差 %.3f m / %.1f 度" % (check[0], check[1])))
+            continue
+        keep[key] = spec
+    if errors:
+        report["ik_direct_error"] = errors
+    report["ik_direct"] = [spec["fk_bones"][0] for spec in keep.values()]
+    if dropped:
+        report["warnings"].append("这些肢体直写后的实际偏差偏大，已改走精确的 IK 快照：%s"
+                                  % "；".join(dropped))
+    return keep
+
+
+def _search_root_roll(arm_obj, spec: dict, plan: dict, steps: int = 16, rounds: int = 5,
+                      span: float = math.pi) -> bool:
     """搜链根控制器的“扭转”（绕自身骨轴转），让核对偏差最小 —— 抄 Rigify ``correct_rotation`` 的思路。
 
     IK 链的弯曲平面由链根的扭转决定（膝盖 / 手肘朝哪边），Rigify 的快照也会这么搜一遍。
-    只有一次直写没通过核对时才调用，所以通过的那些肢体不用付这个代价。
+    ``span`` 是搜索范围（弧度），默认整圈；只在直写没通过核对时调用。
     返回是否真的搜出了更小的偏差。
     """
     roles = plan.get("roles") or []
@@ -319,6 +440,7 @@ def _search_root_roll(arm_obj, spec: dict, plan: dict, steps: int = 16, rounds: 
         return False
     matrix = pbone.matrix.copy()
     base, translation = matrix.to_3x3(), matrix.translation.copy()
+    span = max(1e-4, abs(float(span)))
 
     def apply(angle: float) -> None:
         rolled = base @ Matrix.Rotation(angle, 3, "Y")
@@ -327,9 +449,9 @@ def _search_root_roll(arm_obj, spec: dict, plan: dict, steps: int = 16, rounds: 
 
     start = _limb_check_score(arm_obj, spec, roles)
     best_angle, best_score = 0.0, start
-    step = 2.0 * math.pi / steps
+    step = 2.0 * span / steps
     for index in range(1, steps + 1):
-        angle = -math.pi + step * index
+        angle = -span + step * index
         apply(angle)
         score = _limb_check_score(arm_obj, spec, roles)
         if score < best_score:
@@ -473,15 +595,15 @@ def apply_ik_direct(arm_obj, plans: dict, targets: dict, refs: dict, metrics: di
         if written <= 0:
             failed.append((name, "没找到能直写的控制器"))
             continue
-        if check is not None:
-            measured[name] = [round(float(check[0]), 4), round(float(check[1]), 2)]
-        if check is None or check[0] > IK_DIRECT_POS_TOL or check[1] > IK_DIRECT_ANGLE_TOL:
-            # 没过：按 Rigify 的思路搜一下链根的扭转（弯曲平面），能救回来就救
-            if check is not None and _search_root_roll(arm_obj, spec, plan):
+        measured[name] = ([round(float(check[0]), 4), round(float(check[1]), 2)]
+                          if check is not None else None)
+        if check is not None and not _ik_check_passed(check):
+            # 没过：按 Rigify 的思路搜一遍链根的扭转（弯曲平面），能救回来就救
+            if _search_root_roll(arm_obj, spec, plan):
                 check = _ik_direct_check(arm_obj, spec, plan["roles"])
                 measured[name] = ([round(float(check[0]), 4), round(float(check[1]), 2)]
                                   if check is not None else None)
-        if check is None or check[0] > IK_DIRECT_POS_TOL or check[1] > IK_DIRECT_ANGLE_TOL:
+        if not _ik_check_passed(check):
             failed.append((name, "没法核对（没有 DEF-* 变形骨）" if check is None
                            else "偏差 %.3f m / %.1f 度" % (check[0], check[1])))
             continue
@@ -627,17 +749,24 @@ def apply_pose(arm_obj, bmap, metrics, recon, options=None) -> dict:
 
     view_layer = bpy.context.view_layer
 
-    # Rigify 生成骨架的手臂 / 大腿默认挂在 IK 控制器上。IK 模式下能直写 IK 控制器的肢体就
-    # 直写（不切 FK、不做快照）；其余肢体（写 FK / 退回快照）仍然要先把它们切到 FK，
-    # 否则 IK 链会盖住 FK 结果，而且后面的 IK 快照读到的也是错的姿态。
-    limb_mode = limb_mode_option(options)
+    # Rigify 生成骨架的手臂 / 大腿默认挂在 IK 控制器上。这次按“肢体写入方式”逐条决定：
+    #   * 写成 IK 的肢体：能直写 IK 控制器就直写（不切 FK、不做快照）；
+    #   * 写成 FK 的肢体、以及映射还指着 FK 骨骼的肢体：先把它们切到 FK 再写，
+    #     否则 IK 链会盖住 FK 结果，而且后面的 IK 快照读到的也是错的姿态。
     limb_specs = rigify_limbs.limb_specs(arm_obj)
     written_limbs = _limbs_written({item[2] for item in plan}, limb_specs)
-    direct_plans = (direct_limb_plans(bmap, written_limbs)
-                    if limb_mode == rigify_limbs.MODE_IK else {})
-    if written_limbs and not direct_plans:
-        rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_FK, report, written_limbs,
-                              sync=False)
+    limb_modes = {key: limb_mode_for(spec.get("kind"), options)
+                  for key, spec in written_limbs.items()}
+    fk_limbs = {key: spec for key, spec in written_limbs.items()
+                if limb_modes.get(key) == rigify_limbs.MODE_FK}
+    ik_limbs = {key: spec for key, spec in written_limbs.items()
+                if limb_modes.get(key) == rigify_limbs.MODE_IK}
+    direct_plans = direct_limb_plans(bmap, ik_limbs) if ik_limbs else {}
+    need_fk = dict(fk_limbs)
+    need_fk.update({key: spec for key, spec in ik_limbs.items()
+                    if key not in direct_plans})
+    if need_fk:
+        rigify_limbs.set_mode(arm_obj, rigify_limbs.MODE_FK, report, need_fk, sync=False)
         if view_layer is not None:
             view_layer.update()
 
@@ -682,14 +811,21 @@ def apply_pose(arm_obj, bmap, metrics, recon, options=None) -> dict:
     if direct_plans:
         direct_done = apply_ik_direct(arm_obj, direct_plans, targets, recon["refs"],
                                       metrics, options, report)
+        # 直写是“自算”的，最终关节位置还会被 IK 再解一次：按实际结果复核，偏大的退回快照
+        direct_done = verify_ik_direct(arm_obj, direct_done, report, limb_specs)
 
-    close_limbs(arm_obj, written_limbs, limb_mode, report, options, limb_specs,
-                direct=direct_done)
+    final_modes: dict = {}
+    if fk_limbs:
+        final_modes.update(close_limbs(arm_obj, fk_limbs, rigify_limbs.MODE_FK, report,
+                                       options, limb_specs))
+    if ik_limbs:
+        final_modes.update(close_limbs(arm_obj, ik_limbs, rigify_limbs.MODE_IK, report,
+                                       options, limb_specs, direct=direct_done))
 
     if options.get("keyframe", False):
         frame = int(options.get("frame", bpy.context.scene.frame_current))
         insert_keyframes(arm_obj, bmap, list(report["applied"]), frame, report,
-                         extra_bones=_limb_keyframe_bones(written_limbs, limb_mode),
+                         extra_bones=_limb_keyframe_bones(written_limbs, final_modes),
                          prop_bones=[spec["prop_bone"] for spec in written_limbs.values()])
 
     report["ok"] = bool(report["applied"])

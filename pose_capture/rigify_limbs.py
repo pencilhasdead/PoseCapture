@@ -7,8 +7,8 @@
     骨骼的旋转不会改变形 —— 用户会以为“控制器坏了”；
   * Rigify 自带的 “IK->FK (hand.L)” 按钮本质是
     ``pose.rigify_limb_ik2fk_<rig_id>``（``RigifyLimbIk2FkBase.apply_frame_state``）：
-    读 FK 链的姿态矩阵，算出 IK 控制器的变换。
-    实测把 FK 姿态搬过去、再把 IK_FK 切回 0 之后，所有 DEF 骨的位置误差 0.000000 m，
+    读 FK 链的姿态矩阵，算出 IK 控制器的变换。实测把 FK 姿态搬过去、再把 IK_FK 切回 0 之后，
+    骨骼方向与 FK 一致，关节位置差几毫米（膝盖 / 肘最明显 —— IK 链自己的 stretch / hinge），
     手指 / 脚趾也全部跟随。
 
 于是插件写姿态的顺序是：
@@ -19,8 +19,9 @@
   ``correct_rotation`` 搜一遍绕自身轴的扭转（IK 链的弯曲平面）；开了极向目标（``pole_vector``）
   就用 :func:`place_pole` 把 ``*_ik_target`` 摆进 FK 链的平面；FK 链也顺手写一份（IK 模式下它是
   隐藏的，用户拖滑块回 FK 时姿态不丢，直写也要拿它当增量来源）。写完用 ``DEF-*`` 变形骨核对
-  （关节位置 2 cm / 方向 10°；不比尾巴，IK 带出来的 DEF 骨会被 stretch 拉长），对不上的肢体自动
-  退回下面的老路径，所以最坏情况也只是“没直写成功”，不会写出错姿态。**不切 FK、不做快照**；
+  （关节位置 2 cm / 方向 10°；不比尾巴，IK 带出来的 DEF 骨会被 stretch 拉长），**全部写完后再按
+  最终结果复核一遍（8 mm / 4°）**，没对上的肢体自动退回下面的老路径 / 按设置停在 FK ——
+  所以最坏情况也只是“没直写成功”，不会写出错姿态。**不切 FK、不做快照**；
 * **退回路径（老行为）**：切到 FK -> 写 FK 旋转 -> 调 Rigify 自带的 “IK->FK” 快照把 IK 控制器
   对齐（pole / 拉伸 / 脚跟的数学都由 Rigify 算）-> 停在 IK 或 FK。
 
@@ -42,6 +43,36 @@ from . import utils
 MODE_IK = "IK"
 MODE_FK = "FK"
 MODES = (MODE_IK, MODE_FK)
+
+# “肢体写入方式”的组合：胳膊 / 腿可以分别选 IK 还是 FK。
+# 实测两种模式的变形结果差 0.2 px 量级（FK/IK 不是精度来源），真正的差别在“好不好改”：
+#   * 腿 IK：`foot_ik` 在根空间，改躯干 / 骨盆时脚还钉在解出来的落点上（实测转 torso 10°，
+#     脚的位移 IK 0.2 mm / FK 174 mm），接触优先；
+#   * 臂 FK：手臂的 roll 由 `armbend` 参考轴解析算出，比 IK 链根的扭转搜索更直接（实测
+#     膝盖/手肘那 2 px 的差就来自这一步）。
+# 默认仍是全 IK（Rigify 生成本来就是 IK），需要时再按种类拆开。
+LIMB_MODE_COMBOS = {
+    "IK": {"Arm": MODE_IK, "Leg": MODE_IK},
+    "FK": {"Arm": MODE_FK, "Leg": MODE_FK},
+    "IK_LEG": {"Arm": MODE_FK, "Leg": MODE_IK},
+    "FK_LEG": {"Arm": MODE_IK, "Leg": MODE_FK},
+}
+
+
+def limb_mode_map(mode: str) -> dict:
+    """把“肢体写入方式”拆成 ``{"Arm": "IK"/"FK", "Leg": ...}``（给按种类的自动匹配用）。"""
+    combo = LIMB_MODE_COMBOS.get(str(mode or "").upper())
+    if combo:
+        return dict(combo)
+    return {"Arm": MODE_IK, "Leg": MODE_IK}
+
+
+def mode_for_kind(kind: str, mode: str) -> str:
+    """某种肢体（``Arm`` / ``Leg``）在这种“肢体写入方式”下应该写成 IK 还是 FK。"""
+    combo = LIMB_MODE_COMBOS.get(str(mode or "").upper())
+    if combo is None:
+        return MODE_FK if str(mode or "").upper() == MODE_FK else MODE_IK
+    return combo.get(str(kind or ""), MODE_IK)
 
 _JSON_KEYS = ("fk_bones", "ik_bones", "ctrl_bones", "tail_bones", "extra_ctrls")
 _STR_KEYS = ("prop_bone", "pole_prop")
@@ -281,21 +312,23 @@ def ik_write_plan(spec: dict) -> dict | None:
             "tip_fk": fk_bones[1]}
 
 
-def mapped_limb_mode(arm_obj, bmap, specs: dict = None) -> str:
-    """映射里的四肢骨整体指向哪种模式：``"IK"`` / ``"FK"`` / ``""``（没四肢或分不出来）。
+def mapped_limb_modes(arm_obj, bmap, specs: dict = None) -> dict:
+    """映射里的四肢骨按种类分别指向哪种模式：``{"Arm": "IK", "Leg": "FK"}``。
 
-    改了“肢体写入方式”之后用它判断该不该重新自动匹配肢体骨名：映射指向 FK 骨骼却选了 IK，
-    写出来的姿态在 IK 模式下是看不见的。
+    值为 ``""`` 表示这种肢体没映射 / 分不出来。改了“肢体写入方式”之后用它判断该不该
+    重新自动匹配肢体骨名：映射指向 FK 骨骼却选了 IK，写出来的姿态在 IK 模式下是看不见的。
     """
     specs = specs if specs is not None else limb_specs(arm_obj)
-    if not specs:
-        return ""
-    ik = fk = 0
+    counts: dict = {}
     for spec in specs.values():
+        kind = str(spec.get("kind") or "")
+        if not kind:
+            continue
         plan = ik_write_plan(spec)
         roles = (plan or {}).get("roles") or []
         controls = _limb_controls(spec)
         fk_bones = set(spec.get("fk_bones") or [])
+        ik, fk = counts.get(kind, (0, 0))
         for role in roles:
             name = bmap.get(role)
             if not name:
@@ -304,10 +337,23 @@ def mapped_limb_mode(arm_obj, bmap, specs: dict = None) -> str:
                 ik += 1
             elif name in fk_bones:
                 fk += 1
-    if ik > fk:
-        return MODE_IK
-    if fk > ik:
-        return MODE_FK
+        counts[kind] = (ik, fk)
+    out: dict = {}
+    for kind, (ik, fk) in counts.items():
+        out[kind] = MODE_IK if ik > fk else (MODE_FK if fk > ik else "")
+    return out
+
+
+def mapped_limb_mode(arm_obj, bmap, specs: dict = None) -> str:
+    """映射里的四肢骨整体指向哪种模式：``"IK"`` / ``"FK"`` / ``""``（没四肢或分不出来）。
+
+    ``""`` 也包括“胳膊和腿指向不同模式”（按种类拆开写入）的情况 —— 老的单值接口只
+    用来做粗略判断，按种类判断请用 :func:`mapped_limb_modes`。
+    """
+    modes = mapped_limb_modes(arm_obj, bmap, specs)
+    found = {mode for mode in modes.values() if mode}
+    if len(found) == 1:
+        return found.pop()
     return ""
 
 

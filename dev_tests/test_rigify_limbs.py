@@ -47,6 +47,8 @@ def world_point(rig, name):
 
 
 def snapshot(rig, names=DEF_NAMES):
+    # 刚改过 IK_FK 的话依赖图可能要再推一次才算出新的 DEF-*（retarget._settle_view 的注释）
+    bpy.context.view_layer.update()
     return {name: world_point(rig, name) for name in names if name in rig.pose.bones}
 
 
@@ -218,6 +220,67 @@ def main():
     check(error_ik < 25.0, "画面内偏差在阈值内", failures)
     expect_collections(rig, "IK", failures)
 
+    # ---------------------------------------------------------------- 4b) 按肢体种类拆开
+    print("[3c] limb_mode=IK_LEG（腿 IK + 臂 FK）")
+    reset_pose(rig)
+    bmap_mix = rigify_map.auto_detect(rig, False, {"Arm": "FK", "Leg": "IK"})
+    metrics_mix = rigify_map.read_metrics(rig, bmap_mix)
+    print("  混合模式匹配：", {role: bmap_mix.get(role) for role in
+                              ("upper_arm.L", "hand.L", "thigh.L", "foot.L")})
+    check(bmap_mix.get("upper_arm.L") == "upper_arm_fk.L"
+          and bmap_mix.get("thigh.L") == "thigh_ik.L",
+          "臂映射到 FK、腿映射到 IK", failures,
+          "%s / %s" % (bmap_mix.get("upper_arm.L"), bmap_mix.get("thigh.L")))
+    report_mix = retarget.apply_pose(rig, bmap_mix, metrics_mix, recon,
+                                     dict(OPTIONS, limb_mode="IK_LEG"))
+    check(report_mix.get("ok", False), "混合模式写入成功", failures, report_mix["message"])
+    print("  报告：", report_mix.get("message"), "| 直写：", report_mix.get("ik_direct"),
+          "| 快照：", report_mix.get("ik_snapped"))
+    modes = rigify_limbs.limb_modes(rig)
+    arm_fk = all(abs(value - 1.0) < 1e-6 for name, value in modes.items()
+                 if name.startswith("upper_arm"))
+    leg_ik = all(abs(value) < 1e-6 for name, value in modes.items()
+                 if name.startswith("thigh"))
+    check(arm_fk and leg_ik, "臂停在 FK、腿停在 IK", failures, str(modes))
+    mixed_points = snapshot(rig)
+    mixed_shift = worst_shift(fk_points, mixed_points)
+    print("  混合模式与 FK 模式的 DEF 骨最大位置差 %.6f m" % mixed_shift)
+    check(mixed_shift < retarget.IK_DIRECT_POS_TOL, "混合模式结果与 FK 一致", failures,
+          "（%.4f m）" % mixed_shift)
+    state = collection_state(rig)
+    check(state.get("Arm.L (FK)") is True and state.get("Arm.L (IK)") is False,
+          "臂显示 FK 控制器", failures, str(state))
+    check(state.get("Leg.L (IK)") is True and state.get("Leg.L (FK)") is False,
+          "腿显示 IK 控制器", failures, str(state))
+    error_mix = landmark_error(keypoints, synth_from_def(rig)[0])
+    print("  混合模式画布内平均偏差 %.2f 像素（FK %.2f）" % (error_mix, error_fk))
+    check(error_mix < 25.0, "混合模式画面内偏差在阈值内", failures)
+
+    # ---------------------------------------------------------------- 4c) 直写失败停在 FK
+    print("[3d] ik_fallback=FK（没直写 / 复核不过的肢体停在 FK，不做快照）")
+    reset_pose(rig)
+    report_fbf = retarget.apply_pose(rig, bmap_ik, metrics_ik, recon,
+                                     dict(OPTIONS, limb_mode="IK", ik_fallback="FK"))
+    check(report_fbf.get("ok", False), "写入成功", failures, report_fbf["message"])
+    print("  报告：", report_fbf.get("message"), "| 直写：", report_fbf.get("ik_direct"))
+    for line in (report_fbf.get("warnings") or []):
+        print("   警告：", line)
+    check(not report_fbf.get("ik_snapped"), "按设置不做快照", failures,
+          str(report_fbf.get("ik_snapped")))
+    check(bool(report_fbf.get("fk_switched")), "没直写的肢体停在 FK", failures)
+    fk_modes = rigify_limbs.limb_modes(rig)
+    direct_props = {(specs.get(key) or {}).get("prop_bone")
+                    for key in report_fbf.get("ik_direct") or []}
+    stayed = [name for name, value in fk_modes.items()
+              if abs(value - 1.0) < 1e-6 and name not in direct_props]
+    print("  停在 FK：", stayed, "| 直写留在 IK：", sorted(x for x in direct_props if x))
+    check(bool(stayed), "至少有一条肢体停在 FK", failures)
+    fallback_points = snapshot(rig)
+    fallback_shift = worst_shift(fk_points, fallback_points)
+    print("  停 FK 路径与 FK 模式的 DEF 骨最大位置差 %.6f m" % fallback_shift)
+    check(fallback_shift < retarget.IK_DIRECT_POS_TOL, "停 FK 的姿态与 FK 模式一致", failures,
+          "（%.4f m）" % fallback_shift)
+
     # ---------------------------------------------------------------- 4b) 老配置：退回快照
     print("[3b] limb_mode=IK + FK 骨骼映射（退回 Rigify 快照）")
     reset_pose(rig)
@@ -232,7 +295,12 @@ def main():
     fb_points = snapshot(rig)
     fb_shift = worst_shift(fk_points, fb_points)
     print("  快照路径与 FK 模式的 DEF 骨最大位置差 %.6f m" % fb_shift)
-    check(fb_shift < 1e-4, "IK 快照结果与 FK 结果一致（< 0.1 mm）", failures)
+    for name in sorted(fk_points):
+        delta = (fk_points[name] - fb_points.get(name, fk_points[name])).length
+        print("    %-20s %.6f m" % (name, delta))
+    check(fb_shift < retarget.IK_FINAL_POS_TOL,
+          "IK 快照结果与 FK 结果一致（IK 链的 stretch / hinge 会差几毫米）", failures,
+          "（%.4f m）" % fb_shift)
     check(all(abs(v) < 1e-6 for v in rigify_limbs.limb_modes(rig).values()),
           "四条肢体的 IK_FK 都 = 0（IK）", failures)
 

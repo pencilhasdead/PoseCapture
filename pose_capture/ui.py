@@ -135,6 +135,8 @@ class PC_PT_main(bpy.types.Panel):
         box.label(text="4. 写入 Pose", icon="POSE_HLT")
         col = box.column(align=True)
         col.prop(settings, "limb_mode")
+        if settings.limb_mode != "FK":
+            col.prop(settings, "ik_fallback")
         if settings.armature is not None and rigify_limbs.limb_specs(settings.armature):
             modes = rigify_limbs.limb_modes(settings.armature)
             text = ", ".join("%s=%s" % (name.split(".")[0], "FK" if value >= 0.5 else "IK")

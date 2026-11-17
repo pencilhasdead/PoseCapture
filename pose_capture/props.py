@@ -8,7 +8,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProp
                        IntProperty, PointerProperty, StringProperty)
 from bpy.types import AddonPreferences, PropertyGroup
 
-from . import deps, depth, reconstruction, rigify_map, utils
+from . import deps, depth, reconstruction, rigify_limbs, rigify_map, utils
 
 
 class PC_BoneMapping(PropertyGroup):
@@ -93,13 +93,27 @@ class PC_Settings(PropertyGroup):
     limb_mode: EnumProperty(
         name="肢体写入方式",
         items=[("IK", "IK 控制器（Rigify 默认）",
-                "直接把姿态写进 hand_ik / foot_ik / upper_arm_ik / thigh_ik 这些 IK 控制器"
-                "（不切 FK、不做 IK->FK 快照）；顺带把 FK 链也写一份，拖回 FK 时姿态不丢。"
-                "自动匹配骨骼名时肢体也会优先匹配 IK 控制器（推荐）"),
+                "四肢都直接写 IK 控制器（不切 FK、不做 IK->FK 快照），顺带把 FK 链也写一份。"
+                "手 / 脚钉在解出来的位置上：之后调躯干 / 骨盆时手脚不会跟着跑"
+                "（实测转躯干 10°，脚只动 0.2 mm；FK 模式会动 17 cm）"),
                ("FK", "FK 骨骼",
-                "姿态停在 FK 骨骼上（IK_FK 滑块 = 1），并把 IK 控制器藏起来；"
-                "自动匹配骨骼名时肢体优先匹配 *_fk")],
+                "四肢都停在 FK 骨骼上（IK_FK 滑块 = 1）并藏起 IK 控制器。"
+                "肘 / 膝朝向更好控、骨长不会被 IK 拉伸；需要烘焙 / 重定向到别的骨架时用"),
+               ("IK_LEG", "腿 IK + 臂 FK",
+                "腿写 IK（脚踩住的落点最值钱）、手臂写 FK（肘的 roll 直接由弯曲轴算出，"
+                "比 IK 的极点搜索更准）"),
+               ("FK_LEG", "腿 FK + 臂 IK",
+                "反过来：腿写 FK、手臂写 IK（手要扶 / 抓东西时用）")],
         default="IK")
+    ik_fallback: EnumProperty(
+        name="直写没成功时",
+        items=[("SNAP", "退回 Rigify 快照（精确）",
+                "切 FK -> 调 Rigify 自己的 IK->FK 快照 -> 切回 IK：方向与 FK 一致、关节位置差几毫米"
+                "（IK 链的 hinge / stretch），代价是要重新算一遍 IK（需要生成脚本还在）"),
+               ("FK", "停在 FK 骨骼",
+                "不做快照，这几条肢体停在 FK：姿态一样精确（就是 FK 链那份），"
+                "只是控制器换成 FK 那组")],
+        default="SNAP")
     sync_visibility: BoolProperty(
         name="同步控制器显示", default=True,
         description="IK 模式只显示 IK 控制器、FK 模式只显示 FK 控制器，"
@@ -262,9 +276,18 @@ def options_from_settings(settings: PC_Settings) -> dict:
         "keep_depth": True,
         "fk_mode": settings.limb_mode == "FK",
         "limb_mode": settings.limb_mode,
+        "ik_fallback": settings.ik_fallback,
         "sync_visibility": settings.sync_visibility,
         "keyframe": settings.keyframe,
     }
+
+
+def limb_mode_map(settings: PC_Settings) -> dict:
+    """``{"Arm": "IK"/"FK", "Leg": ...}``：把“肢体写入方式”拆成按肢体种类。
+
+    自动匹配骨骼名时用它：胳膊 / 腿可以分别要求 IK 控制器或 FK 骨骼。
+    """
+    return rigify_limbs.limb_mode_map(getattr(settings, "limb_mode", "IK"))
 
 
 def resolve_model_paths() -> tuple[str, str, bool]:

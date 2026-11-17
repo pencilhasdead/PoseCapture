@@ -261,6 +261,45 @@ check(retarget.limb_mode_option({"limb_mode": "IK"}) == "IK"
       and retarget.limb_mode_option({"fk_mode": True}) == "FK"
       and retarget.limb_mode_option({}) == "IK", "写入方式选项解析正常")
 
+print("[5] 按肢体种类拆开的写入方式（腿 IK + 臂 FK）")
+bmap_mix = rigify_map.auto_detect(rig, False, {"Arm": "FK", "Leg": "IK"})
+check(bmap_mix.get("upper_arm.L") == "upper_arm_fk.L" and bmap_mix.get("hand.L") == "hand_fk.L",
+      "臂按 FK 匹配", str(bmap_mix.get("upper_arm.L")))
+check(bmap_mix.get("thigh.L") == "thigh_ik.L" and bmap_mix.get("foot.L") == "foot_ik.L",
+      "腿按 IK 匹配", str(bmap_mix.get("thigh.L")))
+check(bmap_mix.get("spine_00") == "spine_fk" and bmap_mix.get("shoulder.L") == "shoulder.L",
+      "躯干 / 锁骨不受影响", "%s / %s" % (bmap_mix.get("spine_00"), bmap_mix.get("shoulder.L")))
+check(rigify_map.ordered_candidates("thigh.{s}", "R", {"Arm": "FK", "Leg": "IK"})[0]
+      == "thigh_ik.R"
+      and rigify_map.ordered_candidates("upper_arm.{s}", "R", {"Arm": "FK", "Leg": "IK"})[0]
+      == "upper_arm_fk.R", "候选顺序按角色自己的种类取")
+check(rigify_limbs.mode_for_kind("Arm", "IK_LEG") == "FK"
+      and rigify_limbs.mode_for_kind("Leg", "IK_LEG") == "IK"
+      and rigify_limbs.mode_for_kind("Leg", "FK_LEG") == "FK"
+      and rigify_limbs.mode_for_kind("Leg", "") == "IK",
+      "按种类解模式（IK_LEG / FK_LEG / 空）")
+check(rigify_limbs.limb_mode_map("FK_LEG") == {"Arm": "IK", "Leg": "FK"},
+      "写入方式拆成按种类的字典", str(rigify_limbs.limb_mode_map("FK_LEG")))
+check(retarget.limb_mode_for("Arm", {"limb_mode": "IK_LEG"}) == "FK"
+      and retarget.limb_mode_for("Leg", {"limb_mode": "IK_LEG"}) == "IK"
+      and retarget.limb_mode_for("Arm", {"limb_mode": "FK"}) == "FK"
+      and retarget.limb_mode_for("Arm", {}) == "IK", "retarget 按种类解模式")
+modes = rigify_limbs.mapped_limb_modes(None, bmap_mix, plans)
+check(modes == {"Arm": "FK", "Leg": "IK"}, "映射按种类认模式", str(modes))
+check(rigify_limbs.mapped_limb_mode(None, bmap_mix, plans) == "",
+      "胳膊腿不一样时单值接口返回空串")
+check(rigify_limbs.mapped_limb_modes(None, bmap_fk, plans) == {"Arm": "FK", "Leg": "FK"}
+      and rigify_limbs.mapped_limb_modes(None, bmap_ik, plans) == {"Arm": "IK", "Leg": "IK"},
+      "单一模式时两种种类都认得出来")
+legs_only = retarget.direct_limb_plans(
+    bmap_mix, plans,
+    mode_of=lambda key, spec: rigify_limbs.mode_for_kind(spec.get("kind"), "IK_LEG"))
+check(sorted(legs_only) == ["thigh_fk.R"], "只有腿进直写名单", str(sorted(legs_only)))
+mixed_kf = retarget._limb_keyframe_bones(plans, {"upper_arm_fk.L": "FK",
+                                                 "thigh_fk.R": "IK"})
+check("hand_ik.L" not in mixed_kf and "foot_ik.R" in mixed_kf,
+      "关键帧按肢体各自的模式收", str(sorted(mixed_kf)))
+
 print("结果：", "通过 ✓" if not failures else "未通过 ✗")
 for item in failures:
     print("   -", item)

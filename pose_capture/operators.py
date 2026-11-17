@@ -181,6 +181,10 @@ def report_summary(report: dict) -> str:
     parts = [report.get("message", "")]
     if report.get("ik_direct"):
         parts.append("已直写 IK 控制器（%s）" % ", ".join(report["ik_direct"]))
+    errors = report.get("ik_direct_error") or {}
+    worst = [value for value in errors.values() if value]
+    if worst:
+        parts.append("直写偏差 ≤ %.1f mm" % (max(value[0] for value in worst) * 1000.0))
     if report.get("ik_snapped"):
         parts.append("IK 控制器已对齐（%s）" % ", ".join(report["ik_snapped"]))
     if report.get("fk_switched"):
@@ -885,7 +889,7 @@ class PC_OT_use_active_armature(bpy.types.Operator):
             self.report({"ERROR"}, "请先选中一个骨架对象")
             return {"CANCELLED"}
         settings.armature = obj
-        bmap = rigify_map.auto_detect(obj, settings.fingers, settings.limb_mode)
+        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings))
         props.sync_mapping_to_settings(settings, bmap)
         self.report({"INFO"}, "已绑定 %s，映射角色 %d 个（缺失 %d 个）"
                     % (obj.name, len(bmap.roles), len(bmap.missing)))
@@ -902,7 +906,7 @@ class PC_OT_auto_map(bpy.types.Operator):
         if arm_obj is None:
             self.report({"ERROR"}, "请先指定目标骨架")
             return {"CANCELLED"}
-        bmap = rigify_map.auto_detect(arm_obj, settings.fingers, settings.limb_mode)
+        bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings))
         props.sync_mapping_to_settings(settings, bmap)
         utils.log("骨骼映射：", bmap.roles)
         utils.log("未找到：", bmap.missing)
@@ -929,7 +933,7 @@ class PC_OT_add_metarig(bpy.types.Operator):
 
         obj = context.object
         settings.armature = obj
-        bmap = rigify_map.auto_detect(obj, settings.fingers, settings.limb_mode)
+        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings))
         props.sync_mapping_to_settings(settings, bmap)
         self.report({"INFO"}, "已添加 %s" % obj.name)
         return {"FINISHED"}
@@ -962,7 +966,7 @@ class PC_OT_generate_rig(bpy.types.Operator):
         generated = context.object
         if generated is not None and generated.type == "ARMATURE":
             settings.armature = generated
-            bmap = rigify_map.auto_detect(generated, settings.fingers, settings.limb_mode)
+            bmap = rigify_map.auto_detect(generated, settings.fingers, props.limb_mode_map(settings))
             props.sync_mapping_to_settings(settings, bmap)
             self.report({"INFO"}, "已生成 %s 并更新映射" % generated.name)
         return {"FINISHED"}
@@ -1043,12 +1047,14 @@ class PC_OT_apply_pose(bpy.types.Operator):
         bmap = props.mapping_from_settings(settings)
         stale = [name for name in bmap.used_bones() if name not in arm_obj.data.bones]
         # 肢体骨跟“肢体写入方式”不一致（选了 IK 却映射到 FK 骨骼）时也要重匹配：
-        # 否则 IK 模式下写到 FK 骨骼上的姿态是看不见的。
-        switched = rigify_limbs.mapped_limb_mode(arm_obj, bmap) not in ("", settings.limb_mode)
+        # 否则 IK 模式下写到 FK 骨骼上的姿态是看不见的。按种类分别比（胳膊和腿可以不一样）。
+        want = props.limb_mode_map(settings)
+        got = rigify_limbs.mapped_limb_modes(arm_obj, bmap)
+        switched = any(mode and mode != want.get(kind) for kind, mode in got.items())
         remap = (not bmap.roles or (stale and settings.auto_map_on_apply)
                  or (switched and settings.auto_map_on_apply))
         if remap:
-            bmap = rigify_map.auto_detect(arm_obj, settings.fingers, settings.limb_mode)
+            bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings))
             props.sync_mapping_to_settings(settings, bmap)
             utils.log("已重新自动匹配骨骼名")
 

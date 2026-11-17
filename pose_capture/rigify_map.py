@@ -142,18 +142,48 @@ def _pick(name_set, candidates: list[str]) -> str:
     return ""
 
 
-def ordered_candidates(role_id: str, side: str = "", limb_mode: str = None) -> list[str]:
+ARM_ROLE_STEMS = ("shoulder", "upper_arm", "forearm", "hand", "palm") + FINGERS
+LEG_ROLE_STEMS = ("thigh", "shin", "foot", "toe")
+
+
+def role_kind(role_id: str) -> str:
+    """角色属于哪条肢体：``"Arm"`` / ``"Leg"`` / ``""``（躯干、脖子、头这些）。"""
+    stem = str(role_id or "").split(".")[0]
+    if stem in LEG_ROLE_STEMS:
+        return "Leg"
+    if stem in ARM_ROLE_STEMS:
+        return "Arm"
+    return ""
+
+
+def _mode_for_role(role_id: str, limb_mode) -> str:
+    """这次这个角色该优先匹配 IK 控制器还是 FK 骨骼。
+
+    ``limb_mode`` 可以是 ``"IK"`` / ``"FK"``（老的单值），也可以是
+    ``{"Arm": "FK", "Leg": "IK"}``（按种类拆开）—— 后者只认肢体角色的种类。
+    """
+    if isinstance(limb_mode, dict):
+        kind = role_kind(role_id)
+        if not kind:
+            return ""
+        return str(limb_mode.get(kind) or "").upper()
+    return str(limb_mode or "").upper()
+
+
+def ordered_candidates(role_id: str, side: str = "", limb_mode=None) -> list[str]:
     """角色的候选骨名（``{s}`` 已替换成 side）。
 
-    ``limb_mode="IK"`` 时把 IK 控制器（``upper_arm_ik.L`` / ``hand_ik.L`` …）提到最前：
+    这条肢体要写成 IK 时把 IK 控制器（``upper_arm_ik.L`` / ``hand_ik.L`` …）提到最前：
     Rigify 生成骨架的胳膊 / 大腿默认挂在 IK 上，映射到 FK 骨骼的话写出来的姿态看不见。
-    FK 模式或没指定 ``limb_mode`` 时保持原来的 FK 优先顺序（兼容 metarig / 普通骨架）。
+    FK 或没指定时保持原来的 FK 优先顺序（兼容 metarig / 普通骨架）。
+
+    ``limb_mode`` 支持 ``{"Arm": "FK", "Leg": "IK"}`` —— 这时按角色自己的种类取模式。
     """
     for rid, _label, cands in ROLE_DEFS:
         if rid != role_id:
             continue
         ordered: list[str] = []
-        if str(limb_mode or "").upper() == "IK":
+        if _mode_for_role(rid, limb_mode) == "IK":
             ordered.extend(name.format(s=side) for name in IK_ROLE_CANDIDATES.get(rid, ()))
         for name in cands:
             resolved = name.format(s=side)
@@ -163,11 +193,12 @@ def ordered_candidates(role_id: str, side: str = "", limb_mode: str = None) -> l
     return []
 
 
-def auto_detect(arm_obj, include_fingers: bool = True, limb_mode: str = None) -> BoneMap:
+def auto_detect(arm_obj, include_fingers: bool = True, limb_mode=None) -> BoneMap:
     """在骨架上自动匹配角色骨名。
 
     ``limb_mode`` 跟设置里的“肢体写入方式”一致：``"IK"`` 时肢体优先匹配
-    ``*_ik``（IK 控制器），``"FK"`` 或不指定时优先 ``*_fk``。
+    ``*_ik``（IK 控制器），``"FK"`` 或不指定时优先 ``*_fk``；
+    也可以给 ``{"Arm": "FK", "Leg": "IK"}`` 这种**按肢体种类**拆开的字典。
     """
     bones = arm_obj.data.bones
     names = [bone.name for bone in bones]
@@ -222,14 +253,36 @@ def auto_detect(arm_obj, include_fingers: bool = True, limb_mode: str = None) ->
     return bmap
 
 
+def geometry_bone_name(name: str, bones) -> str:
+    """把“写入用的控制器骨”换回“量尺寸用的几何骨”。
+
+    IK 模式会把肢体映射到 ``hand_ik.L`` / ``foot_ik.L`` 这些控制器上，但它们的静止朝向
+    跟 FK（= DEF 链）不一样：实测 ``foot_ik`` 的静止方向是 ``(0, 1, 0)``，``foot_fk`` 是
+    ``(0, -0.85, -0.53)``。骨长 / 静止朝向 / 弯曲参照轴都该按 FK 链量，否则同一个人、同一
+    张照片，写成 IK 和写成 FK 会解出不同的比例与扭转（实测膝盖差 2 cm）。
+    控制器骨找不到对应的 FK 骨时原样返回 —— 普通骨架 / metarig 不受影响。
+    """
+    if not name or "_ik" not in name:
+        return name
+    stem, dot, side = name.partition(".")
+    if not dot or not side or not stem.endswith("_ik"):
+        return name
+    candidate = "%s_fk.%s" % (stem[:-len("_ik")], side)
+    return candidate if candidate in bones else name
+
+
 def read_metrics(arm_obj, bmap: BoneMap) -> dict:
-    """读取静止姿态下的长度 / 方向 / 参照轴，用于 2D 姿态解算与重定向。"""
+    """读取静止姿态下的长度 / 方向 / 参照轴，用于 2D 姿态解算与重定向。
+
+    注意：不管映射指向 IK 控制器还是 FK 骨骼，量的一律是 **FK / DEF 链的几何**
+    （见 :func:`geometry_bone_name`）—— 写入方式不该影响解算出来的比例。
+    """
     bones = arm_obj.data.bones
     metrics: dict = {"errors": [], "warnings": []}
 
     def bone(role: str):
         name = bmap.get(role)
-        return bones.get(name) if name else None
+        return bones.get(geometry_bone_name(name, bones)) if name else None
 
     spine_names = bmap.spine_bones()
     if not spine_names:
@@ -308,7 +361,7 @@ def read_metrics(arm_obj, bmap: BoneMap) -> dict:
     metrics["rest_dir"] = {}
     metrics["rest_mat"] = {}
     for role, name in bmap.roles.items():
-        item = bones.get(name)
+        item = bones.get(geometry_bone_name(name, bones))
         if item is None:
             continue
         direction = Vector(item.tail_local) - Vector(item.head_local)
