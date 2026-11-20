@@ -12,8 +12,8 @@ import numpy as np
 
 import bpy
 
-from . import (coco, deps, depth, depth_view, dwpose, imops, props, reconstruction,
-               retarget, rigify_limbs, rigify_map, sam3d, utils)
+from . import (coco, deps, depth, depth_view, dwpose, goo_physics, imops, mmd_mixamo,
+               props, reconstruction, retarget, rigify_limbs, rigify_map, sam3d, utils)
 
 # 模型 / 检测结果的会话缓存（不写入 .blend，重开文件后需要重新检测）
 _ESTIMATOR_CACHE = {"key": None, "obj": None}
@@ -962,7 +962,7 @@ class PC_OT_use_active_armature(bpy.types.Operator):
             self.report({"ERROR"}, "请先选中一个骨架对象")
             return {"CANCELLED"}
         settings.armature = obj
-        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings))
+        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
         props.sync_mapping_to_settings(settings, bmap)
         self.report({"INFO"}, "已绑定 %s，映射角色 %d 个（缺失 %d 个）"
                     % (obj.name, len(bmap.roles), len(bmap.missing)))
@@ -979,7 +979,7 @@ class PC_OT_auto_map(bpy.types.Operator):
         if arm_obj is None:
             self.report({"ERROR"}, "请先指定目标骨架")
             return {"CANCELLED"}
-        bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings))
+        bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
         props.sync_mapping_to_settings(settings, bmap)
         utils.log("骨骼映射：", bmap.roles)
         utils.log("未找到：", bmap.missing)
@@ -1006,7 +1006,10 @@ class PC_OT_add_metarig(bpy.types.Operator):
 
         obj = context.object
         settings.armature = obj
-        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings))
+        settings.rig_type = "RIGIFY"          # 刚加的是 Rigify 元骨架，别按 Mixamo 去匹配
+        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings),
+                                      "RIGIFY")
+
         props.sync_mapping_to_settings(settings, bmap)
         self.report({"INFO"}, "已添加 %s" % obj.name)
         return {"FINISHED"}
@@ -1039,7 +1042,10 @@ class PC_OT_generate_rig(bpy.types.Operator):
         generated = context.object
         if generated is not None and generated.type == "ARMATURE":
             settings.armature = generated
-            bmap = rigify_map.auto_detect(generated, settings.fingers, props.limb_mode_map(settings))
+            settings.rig_type = "RIGIFY"
+            bmap = rigify_map.auto_detect(generated, settings.fingers,
+                                          props.limb_mode_map(settings), "RIGIFY")
+
             props.sync_mapping_to_settings(settings, bmap)
             self.report({"INFO"}, "已生成 %s 并更新映射" % generated.name)
         return {"FINISHED"}
@@ -1127,7 +1133,7 @@ class PC_OT_apply_pose(bpy.types.Operator):
         remap = (not bmap.roles or (stale and settings.auto_map_on_apply)
                  or (switched and settings.auto_map_on_apply))
         if remap:
-            bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings))
+            bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
             props.sync_mapping_to_settings(settings, bmap)
             utils.log("已重新自动匹配骨骼名")
 
@@ -1393,7 +1399,8 @@ class PC_OT_import_sam3d_mesh(bpy.types.Operator):
             bmap = props.mapping_from_settings(settings)
             if not getattr(bmap, "roles", None):
                 # 还没点过「自动匹配骨骼」也能对齐：就地认一下骨架结构
-                bmap = rigify_map.auto_detect(arm, False)
+                bmap = rigify_map.auto_detect(arm, False, rig_type=getattr(settings, "rig_type", "RIGIFY"))
+
             metrics = rigify_map.read_metrics(arm, bmap)
             pelvis = metrics.get("pelvis")
         except Exception:  # noqa: BLE001
@@ -1458,6 +1465,162 @@ class PC_OT_import_sam3d_mesh(bpy.types.Operator):
         return scale, offset
 
 
+# --------------------------------------------------------------------------- MMD -> Mixamo
+def _selected_armature(context, settings):
+    active = context.active_object
+    if active is not None and active.type == "ARMATURE":
+        return active
+    return settings.armature
+
+
+def _duplicate_model(context, arm):
+    """连同网格复制一份（网格的 Armature 修改器会自动指向新骨架）。"""
+    meshes = mmd_mixamo.find_meshes(arm)
+    for obj in list(context.selected_objects):
+        obj.select_set(False)
+    arm.select_set(True)
+    for obj in meshes:
+        obj.select_set(True)
+    context.view_layer.objects.active = arm
+    bpy.ops.object.duplicate(linked=False)
+    duplicated = context.view_layer.objects.active
+    if duplicated is not None and duplicated.type == "ARMATURE":
+        return duplicated
+    return arm
+
+
+class PC_OT_mmd_to_mixamo(bpy.types.Operator):
+    """把 MMD 骨骼改成 Mixamo 命名（保留头发 / 裙子等非标准骨骼）。"""
+    bl_idname = "pose_capture.mmd_to_mixamo"
+    bl_label = "MMD 骨骼 → Mixamo"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = props.get_settings(context)
+        arm = _selected_armature(context, settings)
+        if arm is None or arm.type != "ARMATURE":
+            self.report({"ERROR"}, "先选中一根 MMD 骨架（或在上方面板指定目标骨架）")
+            return {"CANCELLED"}
+
+        bones = [bone.name for bone in arm.data.bones]
+        parents = {bone.name: (bone.parent.name if bone.parent else None)
+                   for bone in arm.data.bones}
+        plan = mmd_mixamo.plan_conversion(
+            bones, parents, prefix=settings.mmd_prefix,
+            cleanup=bool(settings.mmd_cleanup),
+            translate_extras=bool(settings.mmd_translate_extras))
+        if not plan["rename"] and not plan["delete"]:
+            message = "这个骨架看起来不是 MMD 骨架（一个标准 MMD 骨名都没认出来）"
+            self.report({"WARNING"}, message)
+            settings.mmd_result = message
+            return {"CANCELLED"}
+
+        source = arm
+        if settings.mmd_duplicate:
+            arm = _duplicate_model(context, arm)
+
+        if settings.mmd_strip_helpers:
+            removed = mmd_mixamo.strip_mmd_helpers(arm)
+        else:
+            removed = {"constraints": 0, "drivers": 0}
+
+        report = mmd_mixamo.apply_plan(
+            arm, plan, rename_groups=bool(settings.mmd_rename_groups),
+            merge_weights=bool(settings.mmd_merge_weights))
+
+        parts = [mmd_mixamo.summarize(plan),
+                 "改名 %d / 删 %d / 改层级 %d" % (report["renamed"], report["deleted"],
+                                                report["reparented"]),
+                 "顶点组 %d 改名 / %d 合并" % (report["groups_renamed"],
+                                             report["groups_merged"])]
+        if removed["constraints"] or removed["drivers"]:
+            parts.append("摘掉约束 %d / 驱动器 %d" % (removed["constraints"], removed["drivers"]))
+        if settings.mmd_duplicate:
+            parts.append("基于 %s（原模型保留）" % source.name)
+        summary = "；".join(parts)
+        settings.mmd_result = summary
+        settings.armature = arm
+        utils.log(summary)
+        for note in plan.get("notes") or []:
+            utils.warn(note)
+        for warning in report.get("warnings") or []:
+            utils.warn(warning)
+
+        scale = arm.matrix_world.to_scale()
+        if any(abs(value - 1.0) > 1e-4 for value in scale):
+            utils.warn("骨架缩放不是 1（%s）：Mixamo 上传 / 重定向前先 Ctrl+A 应用缩放"
+                       % tuple(round(value, 3) for value in scale))
+        if not plan.get("hair"):
+            utils.warn("没有认到头发骨（名字里没有 髪 / hair）：确认一下模型是否带头发骨")
+        if report["deleted"] and not settings.mmd_merge_weights:
+            utils.warn("删了控制骨但没有合并权重：这些骨头原来的蒙皮权重会丢失")
+
+        self.report({"INFO"}, summary)
+        return {"FINISHED"}
+
+
+# --------------------------------------------------------------------------- Goo Physics
+def _goo_kinds(settings) -> list[str]:
+    kinds = []
+    if settings.goo_hair:
+        kinds.append("hair")
+    if settings.goo_skirt:
+        kinds.append("skirt")
+    if settings.goo_ribbon:
+        kinds.append("ribbon")
+    return kinds
+
+
+class PC_OT_goo_physics_add(bpy.types.Operator):
+    """一键给头发 / 裙子 / 飘带链加 Goo Physics 物理模拟。"""
+    bl_idname = "pose_capture.goo_physics_add"
+    bl_label = "一键加物理（头发 / 裙子 / 飘带）"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = props.get_settings(context)
+        arm = _selected_armature(context, settings)
+        if arm is None or arm.type != "ARMATURE":
+            self.report({"ERROR"}, "先选中一根骨架（或在上方面板指定目标骨架）")
+            return {"CANCELLED"}
+        kinds = _goo_kinds(settings)
+        if not kinds:
+            self.report({"WARNING"}, "至少勾选一类（头发 / 裙子 / 飘带）")
+            return {"CANCELLED"}
+
+        report = goo_physics.apply(context, arm, kinds, settings.goo_type,
+                                   bool(settings.goo_collider))
+        summary = goo_physics.summarize(report)
+        settings.goo_result = summary
+        utils.log(summary)
+        for warning in report.get("warnings") or []:
+            utils.warn(warning)
+        self.report({"INFO"} if report.get("ok") else {"WARNING"}, summary)
+        return {"FINISHED"}
+
+
+class PC_OT_goo_physics_remove(bpy.types.Operator):
+    """移除头发 / 裙子 / 飘带骨上的 Goo Physics。"""
+    bl_idname = "pose_capture.goo_physics_remove"
+    bl_label = "移除头发 / 裙子上的物理"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = props.get_settings(context)
+        arm = _selected_armature(context, settings)
+        if arm is None or arm.type != "ARMATURE":
+            self.report({"ERROR"}, "先选中一根骨架")
+            return {"CANCELLED"}
+        report = goo_physics.remove(context, arm)
+        summary = goo_physics.summarize(report)
+        settings.goo_result = summary
+        utils.log(summary)
+        for warning in report.get("warnings") or []:
+            utils.warn(warning)
+        self.report({"INFO"} if report.get("ok") else {"WARNING"}, summary)
+        return {"FINISHED"}
+
+
 CLASSES = (
     PC_OT_install_deps,
     PC_OT_download_models,
@@ -1478,7 +1641,12 @@ CLASSES = (
     PC_OT_export_json,
     PC_OT_sam3d_check,
     PC_OT_import_sam3d_mesh,
+    PC_OT_mmd_to_mixamo,
+    PC_OT_goo_physics_add,
+    PC_OT_goo_physics_remove,
 )
+
+
 
 
 

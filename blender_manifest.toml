@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pose_capture"
-version = "1.4.0"
+version = "1.4.2"
 name = "Pose Capture (SAM 3D Body / DWPose to Rigify)"
 tagline = "读取图片，用 SAM 3D Body（或 DWPose + 深度模型）识别人体骨架并转换成 Rigify 骨骼的 Pose"
 maintainer = "Pose Capture"

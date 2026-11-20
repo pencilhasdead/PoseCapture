@@ -56,6 +56,106 @@ SPINE_PATTERNS = ["spine_fk", "spine", "ORG-spine", "DEF-spine"]
 
 FINGERS = ("thumb", "f_index", "f_middle", "f_ring", "f_pinky")
 
+# --------------------------------------------------------------------------- Mixamo
+# 角色 -> Mixamo 骨名后缀（{Side} = Left / Right）。前缀（mixamorig: / mixamorig1: / 无）
+# 从骨架里自动探测，所以三种写法都支持。
+MIXAMO_ROLES = {
+    "hips": "Hips",
+    "neck": "Neck",
+    "head": "Head",
+    "shoulder.{s}": "{Side}Shoulder",
+    "upper_arm.{s}": "{Side}Arm",
+    "forearm.{s}": "{Side}ForeArm",
+    "hand.{s}": "{Side}Hand",
+    "thigh.{s}": "{Side}UpLeg",
+    "shin.{s}": "{Side}Leg",
+    "foot.{s}": "{Side}Foot",
+    "toe.{s}": "{Side}ToeBase",            # 没有 ToeBase 时退回 Toe_End
+    "thumb.01.{s}": "{Side}HandThumb1",
+    "thumb.02.{s}": "{Side}HandThumb2",
+    "thumb.03.{s}": "{Side}HandThumb3",
+    "f_index.01.{s}": "{Side}HandIndex1",
+    "f_index.02.{s}": "{Side}HandIndex2",
+    "f_index.03.{s}": "{Side}HandIndex3",
+    "f_middle.01.{s}": "{Side}HandMiddle1",
+    "f_middle.02.{s}": "{Side}HandMiddle2",
+    "f_middle.03.{s}": "{Side}HandMiddle3",
+    "f_ring.01.{s}": "{Side}HandRing1",
+    "f_ring.02.{s}": "{Side}HandRing2",
+    "f_ring.03.{s}": "{Side}HandRing3",
+    "f_pinky.01.{s}": "{Side}HandPinky1",
+    "f_pinky.02.{s}": "{Side}HandPinky2",
+    "f_pinky.03.{s}": "{Side}HandPinky3",
+}
+# Mixamo 的脊椎链（顺序固定）：Spine -> Spine1 -> Spine2 -> Neck
+MIXAMO_SPINE = ("Spine", "Spine1", "Spine2")
+RIG_TYPES = ("RIGIFY", "MIXAMO")
+RIG_TYPE_LABELS = {"RIGIFY": "Rigify 标准", "MIXAMO": "Mixamo 标准"}
+
+
+def detect_mixamo_prefix(names) -> str:
+    """从骨名里认出 Mixamo 前缀（``mixamorig:`` / ``mixamorig1:`` / 空）。"""
+    names = list(names)
+    for name in names:
+        if name.endswith(":Hips") or name.endswith(":Spine"):
+            return name[:name.rindex(":") + 1]
+    return ""
+
+
+def _mixamo_map(arm_obj, include_fingers: bool, names: list[str]) -> BoneMap:
+    """按 Mixamo 命名匹配角色（不做 IK 控制器那套）。"""
+    bmap = BoneMap()
+    name_set = set(names)
+    prefix = detect_mixamo_prefix(names)
+
+    def pick(*suffixes) -> str:
+        for suffix in suffixes:
+            candidate = prefix + suffix
+            if candidate in name_set:
+                return candidate
+        return ""
+
+    hips = pick("Hips")
+    if hips:
+        bmap.set("hips", hips)
+        bmap.set("root", hips)          # Mixamo 的根位移就写在 Hips 上
+    else:
+        bmap.missing.append("hips")
+
+    for role, suffix in MIXAMO_ROLES.items():
+        if role in ("hips",):
+            continue
+        if "{s}" in role:
+            if not include_fingers and any(role.startswith(f) for f in FINGERS):
+                continue
+            for side, label in (("L", "Left"), ("R", "Right")):
+                rid = role.format(s=side)
+                name = pick(suffix.replace("{Side}", label))
+                if not name and suffix.endswith("ToeBase"):
+                    name = pick(suffix.replace("{Side}", label).replace("ToeBase", "Toe_End"))
+                if name:
+                    bmap.set(rid, name)
+                else:
+                    bmap.missing.append(rid)
+        else:
+            name = pick(suffix)
+            if name:
+                bmap.set(role, name)
+            else:
+                bmap.missing.append(role)
+
+    spine_chain = [pick(suffix) for suffix in MIXAMO_SPINE]
+    spine_chain = [name for name in spine_chain if name]
+    if not spine_chain and hips:
+        # 只有 Hips 没有 Spine：至少让“骨盆 -> 胸”这一段有东西量
+        spine_chain = [hips]
+    for index, name in enumerate(spine_chain[:SPINE_MAX_BONES]):
+        bmap.set("spine_%02d" % index, name)
+    for index in range(len(spine_chain), SPINE_SLOTS):
+        bmap.missing.append("spine_%02d" % index)
+    return bmap
+
+
 # “肢体写入方式 = IK” 时优先匹配的 Rigify IK 控制器（只在骨骼确实存在时才用得上，
 # 拿不到就退回 ROLE_DEFS 里的常规候选，所以 metarig / 普通骨架不受影响）。
 # 参考 `rigify_limbs._DEFAULT_CHAINS`：链根与末端控制器是 upper_arm_ik.L / hand_ik.L /
@@ -193,17 +293,24 @@ def ordered_candidates(role_id: str, side: str = "", limb_mode=None) -> list[str
     return []
 
 
-def auto_detect(arm_obj, include_fingers: bool = True, limb_mode=None) -> BoneMap:
+def auto_detect(arm_obj, include_fingers: bool = True, limb_mode=None,
+                rig_type: str = "RIGIFY") -> BoneMap:
     """在骨架上自动匹配角色骨名。
 
     ``limb_mode`` 跟设置里的“肢体写入方式”一致：``"IK"`` 时肢体优先匹配
     ``*_ik``（IK 控制器），``"FK"`` 或不指定时优先 ``*_fk``；
     也可以给 ``{"Arm": "FK", "Leg": "IK"}`` 这种**按肢体种类**拆开的字典。
+
+    ``rig_type``：``"RIGIFY"``（默认，Rigify 生成骨架 / 元骨架）或 ``"MIXAMO"``
+    （``mixamorig:Hips`` 这类 Mixamo 命名；前缀自动探测）。
     """
     bones = arm_obj.data.bones
     names = [bone.name for bone in bones]
+    if str(rig_type).upper() == "MIXAMO":
+        return _mixamo_map(arm_obj, include_fingers, names)
     name_set = set(names)
     bmap = BoneMap()
+
 
     for role, _label, cands in ROLE_DEFS:
         if "{s}" in role:

@@ -14,7 +14,7 @@ if ADDON_PARENT not in sys.path:
     sys.path.insert(0, ADDON_PARENT)
 
 MODULES = ("utils", "coco", "imops", "dwpose", "deps", "rigify_map",
-           "reconstruction", "retarget", "sam3d", "props", "operators", "ui")
+           "reconstruction", "retarget", "sam3d", "mmd_mixamo", "goo_physics", "props", "operators", "ui")
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
     print("面板 %d 个：%s" % (len(panels), panels))
     for name, error in failures:
         print("!! %s: %s" % (name, error))
-    ok = not failures and len(ops) >= 12 and len(panels) == 3
+    ok = not failures and len(ops) >= 12 and len(panels) >= 3
     print("结果：", "通过 ✓" if ok else "未通过 ✗")
     return 0 if ok else 1
 

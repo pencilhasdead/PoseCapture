@@ -38,6 +38,12 @@ class PC_Settings(PropertyGroup):
     bone_map: CollectionProperty(type=PC_BoneMapping)
     bone_map_index: IntProperty(default=0)
     map_ready: BoolProperty(default=False)
+    rig_type: EnumProperty(
+        name="骨架标准",
+        items=[("RIGIFY", "Rigify 标准", "Rigify 生成骨架 / 元骨架（spine_fk / upper_arm_fk.L …）"),
+               ("MIXAMO", "Mixamo 标准", "Mixamo 命名（mixamorig:Hips / LeftArm / LeftUpLeg …）")],
+        default="RIGIFY")
+
     auto_map_on_apply: BoolProperty(
         name="自动匹配骨骼名", default=True,
         description="Apply 时如果骨骼名失效、或者肢体骨跟“肢体写入方式”不一致"
@@ -65,6 +71,52 @@ class PC_Settings(PropertyGroup):
     recon_source: StringProperty(
         name="最近一次解算来源", default="",
         description="上一次「应用到骨架」实际用的 3D 来源（SAM 3D Body / 深度模型 / 骨长解算）")
+
+    # ---------------- MMD -> Mixamo ----------------
+    mmd_prefix: EnumProperty(
+        name="Mixamo 前缀",
+        items=[("mixamorig:", "mixamorig:（Mixamo 标准）", "Mixamo 动画 / Fbx 用的标准前缀"),
+               ("mixamorig1:", "mixamorig1:（同场景多角色）", "同一场景里有多个角色时用编号前缀"),
+               ("", "无前缀", "只留 Hips / Spine / LeftArm …")],
+        default="mixamorig:")
+    mmd_cleanup: BoolProperty(
+        name="删除 MMD 控制骨", default=True,
+        description="全ての親 / センター / グルーブ / 肩P / 肩C / 足ＩＫ / つま先ＩＫ / 足D …"
+                    "（Mixamo 没有这些槽位；删之前把它们的权重并进父骨、子骨改挂祖先）")
+    mmd_translate_extras: BoolProperty(
+        name="头发 / 裙子等骨骼名翻成英文", default=True,
+        description="例如 左髪1 → hair1.L、スカート_0_1 → skirt01。骨骼本身一根都不删")
+    mmd_rename_groups: BoolProperty(
+        name="同步重命名顶点组", default=True,
+        description="只改骨名不同步顶点组的话蒙皮会全部失效")
+    mmd_merge_weights: BoolProperty(
+        name="被删骨骼的权重并入父骨", default=True)
+    mmd_strip_helpers: BoolProperty(
+        name="摘掉 MMD Tools 追加变换", default=True,
+        description="去掉骨骼约束与驱动器，否则改名后它们还会把骨骼拉回原位")
+    mmd_duplicate: BoolProperty(
+        name="先复制一份再改", default=True,
+        description="保留原始 MMD 模型；关掉就直接改当前骨架（可 Ctrl+Z）")
+    mmd_result: StringProperty(name="MMD → Mixamo 结果", default="")
+
+    # ---------------- Goo Physics（头发 / 裙子 / 飘带） ----------------
+    goo_hair: BoolProperty(name="头发", default=True)
+    goo_skirt: BoolProperty(name="裙子", default=True)
+    goo_ribbon: BoolProperty(name="飘带 / 领结 / 尾巴", default=True)
+    goo_type: EnumProperty(
+        name="物理类型",
+        items=[("AUTO", "自动（头发=软体，裙子=布料）", ""),
+               ("SOFT", "软体链（Soft Body）", ""),
+               ("CLOTH", "布料链（Cloth）", ""),
+               ("GEO", "几何节点链（Geo Nodes）", ""),
+               ("JIGGLE", "抖动（Jiggle，单骨）", "")],
+        default="AUTO")
+    goo_collider: BoolProperty(
+        name="给身体网格加碰撞体", default=True,
+        description="把带骨架修改器的网格交给 Goo Physics 生成碰撞体，裙子和头发才不会穿身体")
+    goo_result: StringProperty(name="Goo Physics 结果", default="")
+
+
 
     facing: EnumProperty(
         name="人物朝向",
@@ -211,6 +263,8 @@ class PC_Preferences(AddonPreferences):
         description="跳出手部解码器：更省显存 / 更快，但手指没有 3D 关键点（Rigify 手指骨不写）")
     sam3d_timeout: IntProperty(name="超时（秒）", default=900, min=60, max=7200,
                                description="子进程超时（首次加载模型 + CPU 推理会比较慢）")
+
+
 
 
     def draw(self, context):

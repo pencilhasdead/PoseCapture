@@ -108,9 +108,11 @@ class PC_PT_main(bpy.types.Panel):
         row = box.row(align=True)
         row.prop(settings, "armature", text="")
         row.operator("pose_capture.use_active_armature", text="", icon="EYEDROPPER")
+        box.prop(settings, "rig_type")
         row = box.row(align=True)
         row.operator("pose_capture.add_metarig", text="新建元骨架")
         row.operator("pose_capture.generate_rig", text="生成控制骨架")
+
         row = box.row(align=True)
         row.operator("pose_capture.auto_map", text="自动匹配骨骼")
         row.operator("pose_capture.reset_pose", text="清空 Pose")
@@ -236,5 +238,99 @@ class PC_PT_log(bpy.types.Panel):
             layout.label(text=line[:90])
 
 
-CLASSES = (PC_UL_bone_map, PC_PT_main, PC_PT_mapping, PC_PT_log)
+class PC_PT_mmd(bpy.types.Panel):
+    """MMD 骨骼 -> Mixamo（保留头发 / 裙子骨）。"""
+    bl_label = "MMD → Mixamo"
+    bl_idname = "PC_PT_mmd"
+    bl_parent_id = "PC_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        from . import mmd_mixamo
+
+        layout = self.layout
+        settings = props.get_settings(context)
+        active = context.active_object
+        target = active if (active is not None and active.type == "ARMATURE") else settings.armature
+
+        col = layout.column(align=True)
+        if target is None:
+            col.label(text="选中一根 MMD 骨架（或在上方面板指定）", icon="INFO")
+        else:
+            col.label(text="目标骨架：%s" % target.name, icon="ARMATURE_DATA")
+            names = [bone.name for bone in target.data.bones]
+            standard = sum(1 for name in names if mmd_mixamo.mixamo_name(name))
+            extras = sum(1 for name in names
+                         if mmd_mixamo.classify(name)[0] == "extra")
+            col.label(text="%d 根：能认出的骨架 %d / 其他（头发·裙子等）%d"
+                      % (len(names), standard, extras), icon="INFO")
+
+        col.prop(settings, "mmd_prefix")
+        col.prop(settings, "mmd_cleanup")
+        col.prop(settings, "mmd_translate_extras")
+        col.prop(settings, "mmd_rename_groups")
+        if settings.mmd_rename_groups:
+            col.prop(settings, "mmd_merge_weights")
+        col.prop(settings, "mmd_strip_helpers")
+        col.prop(settings, "mmd_duplicate")
+        col.operator("pose_capture.mmd_to_mixamo", icon="ARMATURE_DATA",
+                     text="转换（保留头发 / 裙子骨）")
+        if settings.mmd_result:
+            for index, line in enumerate(settings.mmd_result.split("；")):
+                col.label(text=line[:70], icon="CHECKMARK" if index == 0 else "DOT")
+        col.label(text="骨头一根不删（除 MMD 控制骨），头发/裙子骨跟着改名保留", icon="INFO")
+
+
+class PC_PT_physics(bpy.types.Panel):
+    """Goo Physics：一键给头发 / 裙子 / 飘带加物理。"""
+    bl_label = "物理（Goo Physics）"
+    bl_idname = "PC_PT_physics"
+    bl_parent_id = "PC_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        from . import goo_physics
+
+        layout = self.layout
+        settings = props.get_settings(context)
+        active = context.active_object
+        target = active if (active is not None and active.type == "ARMATURE") else settings.armature
+
+        col = layout.column(align=True)
+        info = goo_physics.status()
+        col.label(text=info["message"],
+                  icon="CHECKMARK" if info["enabled"] else "ERROR")
+
+        if target is None:
+            col.label(text="选中一根骨架（或在上方面板指定）", icon="INFO")
+            return
+        groups = goo_physics.bones_by_kind(target)
+        col.label(text="%s：头发 %d / 裙子 %d / 飘带 %d 根"
+                  % (target.name, len(groups["hair"]), len(groups["skirt"]),
+                     len(groups["ribbon"])), icon="ARMATURE_DATA")
+
+        row = col.row(align=True)
+        row.prop(settings, "goo_hair")
+        row.prop(settings, "goo_skirt")
+        row.prop(settings, "goo_ribbon")
+        col.prop(settings, "goo_type")
+        col.prop(settings, "goo_collider")
+        col.operator("pose_capture.goo_physics_add", icon="PHYSICS",
+                     text="一键加物理")
+        col.operator("pose_capture.goo_physics_remove", icon="X",
+                     text="移除这些骨上的物理")
+        if settings.goo_result:
+            for index, line in enumerate(settings.goo_result.split("；")):
+                col.label(text=line[:70],
+                          icon="CHECKMARK" if index == 0 and "⚠" not in line else "DOT")
+        col.label(text="类型/预设/烘焙在 Goo Physics 自己的面板里改", icon="INFO")
+
+
+CLASSES = (PC_UL_bone_map, PC_PT_main, PC_PT_mapping, PC_PT_log, PC_PT_mmd, PC_PT_physics)
+
+
 

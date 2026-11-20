@@ -158,6 +158,27 @@ python dev_tests/install_local.py --dry-run  # 只看会改哪些目录，不动
 > `retarget.build_targets` 的接口），Blender 端 `dev_tests/test_sam3d_rig.py`
 > （合成 MHR70 → 写 Rigify：5 根骨骼方向差 0.0°、左大臂相对静止转 35.7°、网格脚底
 > 0.017 m = 骨架地面 0.017 m）。
+> **1.4.1**：新增 **MMD 骨骼 → Mixamo**（`MMD → Mixamo` 子面板 / `pose_capture.mmd_to_mixamo`，
+> 见 **5.2**）。骨骼对照表整理自 MMD Bone Tools（`QIangIQ/MMD-bone-SDK`，MIT）：下半身→Hips、
+> 上半身(2/3)→Spine(1/2)、足/ひざ/足首→UpLeg/Leg/Foot、腕/ひじ/手首→Arm/ForeArm/Hand、
+> 指→HandXxx1..4；并把「上半身」挂到 Hips 下（MMD 里是兄弟，Mixamo 要求子级）。
+> **头发 / 裙子 / 胸 / 捩り等非标准骨一根不删**（`左髪1 → hair1.L`、`スカート_0_1 → skirt01`），
+> MMD 控制骨（全ての親 / センター / グルーブ / 肩P / 足ＩＫ / 足D…）默认删除且**权重并进父骨**、
+> 子骨改挂最近的保留祖先；同步重命名顶点组（否则蒙皮全丢）；顺带摘掉 MMD Tools 的约束与驱动器。
+> 默认「先复制一份再改」。自检：`test_mmd_mixamo.py`（纯逻辑：映射 / 层级 / 删除 / 保留 /
+> 幂等）、`test_mmd_mixamo_rig.py`（真实骨架：18 个 Mixamo 骨名、Spine<-Hips、头发挂 Head、
+> 裙子挂 Hips、足D 权重并进 LeftUpLeg、约束与驱动器清零、复制模式原模型不动）。
+> **1.4.2**：① `骨架标准` 下拉（`Rigify 标准` / `Mixamo 标准`）——**抓到的姿态可以直接写到
+> `mixamorig:*` 骨架上**（Hips/Spine/Spine1/Neck/Head/{Side}Arm/{Side}ForeArm/{Side}Hand/
+> {Side}UpLeg/{Side}Leg/{Side}Foot/{Side}ToeBase + 15 根手指；`mixamorig:` / `mixamorig1:` /
+> 无前缀自动探测，根位移写 Hips）；实测骨骼方向误差 0.00~0.02°（见 **5.3**）。
+> ② 新增 **物理（Goo Physics）** 子面板：一键给**头发 / 裙子 / 飘带**加 Goo Physics
+> （按骨名分类 → 自动选骨 → 设类型 → 调 `goophys.add_*_physics_to_selected` → 回来逐个骨头核对
+> `gp_has_*_physics` 标记；自动打开 Physics Active；可一键给身体网格加碰撞体，也可一键移除）。
+> 实测：头发 3 根→软体链、裙子 3 根→布料链、飘带 2 根→软体链，碰撞体生成，移除后标记全清（见 **5.4**）。
+> 自检：`test_mixamo_target.py`、`test_goo_physics.py`。
+
+
 
 
 
@@ -268,7 +289,8 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
 | --- | --- |
 | 1 输入图片 | 选“图片文件”并指定路径；“已加载图像”则从 Blender 里挑一个图像数据块。多人时用**人物序号**（0 = 面积最大的人）挑一个 |
 | 2 检测 | 点 **检测姿态**（后台线程跑，不卡界面；按 ESC 可取消）。完成后会生成 `PoseCapture_Preview` 预览图，点旁边的小图标可推到图像编辑器查看骨架；深度模型就绪时会同时算出深度图（`PoseCapture_Depth`，**近=蓝、远=红**，灰度图则**越白=越远**）。旁边的 **深度图预览窗口** 会另开一个独立 Tk 页面，把照片 / 深度灰度 / 深度伪彩并排显示、打出数值统计、并给出**深度方向核对**（物理判据“人比背景近” vs 重建拟合方向，不一致会直接标出来）—— 判断“深度是不是真的算对了”用它最稳（不受 Blender 图像显示链路影响） |
-| 3 目标骨架 | 点 **新建元骨架** + **生成控制骨架** 得到标准 Rigify 人形骨架；也可以直接用你自己已经绑好的 Rigify 骨架（用吸管按钮绑定当前选中对象） |
+| 3 目标骨架 | 先选 **骨架标准**：`Rigify 标准`（点 **新建元骨架** + **生成控制骨架**，或用自己的 Rigify 骨架）或 `Mixamo 标准`（`mixamorig:Hips` 这类骨架，见 5.3，用吸管按钮绑定当前选中对象） |
+
 | 4 映射 | 点 **自动匹配骨骼**（生成骨架会自动认出 `spine_fk / upper_arm_fk.L / thigh_fk.L / neck / head / torso`，元骨架认出 `spine / spine.001 / upper_arm.L …`）。个别骨骼可以在“骨骼映射”子面板里手动指定 |
 | 5 参数 | 按需调姿态解算参数（见下表）。`3D 来源` 默认 **自动**：配置好 SAM 3D Body 就用它（见 5.1），否则用 `深度来源` 的**深度模型**（前后方向来自像素）；想用旧方式就选 `骨长解算` |
 | 6 应用 | 点 **应用到骨架**：只写旋转（可选根位移），自动切到 Pose 模式方便查看；不满意可点 **清空 Pose** 重来 |
@@ -299,7 +321,9 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
 
 | 参数 | 说明 |
 | --- | --- |
+| **骨架标准** | `Rigify 标准`（默认）：按 `spine_fk` / `upper_arm_fk.L` / `torso` 这套名字匹配；`Mixamo 标准`：按 `mixamorig:Hips` / `LeftArm` / `LeftUpLeg` 这套匹配（前缀 `mixamorig` / `mixamorig1:` / 无前缀都能自动认，见 **5.3**） |
 | **3D 来源** | `自动`（默认）：SAM 3D Body 配置齐全就用它，否则退回下面的「深度来源」；`SAM 3D Body`：单图直接出 MHR 人体（含手指 / 脚，带人体先验，见 **5.1**，需要外部 python 环境）；`DWPose + 深度模型`；`骨长解算` |
+
 | 人体框 / 关键点置信度阈值 | 检测的过滤阈值。检测不到人就降低人体框阈值；关键点乱飘就提高关键点阈值 |
 | **人物朝向** | 正面朝镜头 / 背面朝镜头 / 面朝画面左 / 右。决定“画面深处”与左右手的关系，选错会出现整体镜像或反向（`3D 来源 = SAM 3D Body` 时由 3D 肩线 / 胯线自动判定，这项不参与） |
 
@@ -456,10 +480,120 @@ hf download facebook/sam-3d-body-dinov3 --local-dir checkpoints\sam-3d-body-dino
 ---
 
 
+### 5.2 MMD 骨骼 → Mixamo（保留头发 / 裙子骨）
+
+功能对应 **MMD Bone Tools**（[`QIangIQ/MMD-bone-SDK`](https://github.com/QIangIQ/MMD-bone-SDK)，MIT）
+的 `convert --to mixamo`，但搬进了本插件、直接在 Blender 里改骨架：
+
+| 做的事 | 说明 |
+| --- | --- |
+| 标准骨改名 | 下半身→`mixamorig:Hips`、上半身→`Spine`、上半身2→`Spine1`、首→`Neck`、頭→`Head`、肩→`Shoulder`、腕→`Arm`、ひじ→`ForeArm`、手首→`Hand`、指 1/2/3/先→`HandXxx1..4`、足→`UpLeg`、ひざ→`Leg`、足首→`Foot`、つま先→`Toe_End`、足先EX→`ToeBase` |
+| 层级修正 | MMD 里「上半身」和「下半身」是**兄弟**；Mixamo 要求 Spine 是 Hips 的子级 —— 不改这一步，Mixamo 动画转 Hips 时上半身不跟着动 |
+| 控制骨 | 全ての親 / センター / グルーブ / 腰キャンセル / 肩P / 肩C / 足ＩＫ / つま先ＩＫ / 足D / ひざD / 足首D / ダミー 默认删除；删之前**子骨改挂最近的保留祖先**、**权重并进父骨** |
+| **头发 / 裙子** | **一根都不删**：`左髪1 → hair1.L`、`スカート_0_1 → skirt01`、`胸 → breast`… 名字可选翻成英文；翻不出来的（含生僻汉字）保持原名。父级、层级、顶点组权重原样保留 |
+| 蒙皮 | 同步重命名顶点组（不勾选的话蒙皮会全丢）；被删骨的权重并进祖先，没有去处的孤儿组连同权重一起清掉并报警 |
+| MMD Tools 残留 | 摘掉骨骼约束 + 驱动器（否则改名后它们还会把骨骼拉回原位），避免 Mixamo 动画被“追加变换”顶掉 |
+
+**用法**：选中 MMD 骨架 → `N` 面板 → **MMD → Mixamo** 子面板 → 点 **转换（保留头发 / 裙子骨）**。
+默认勾了 **先复制一份再改**，原模型不动；关掉就直接改当前骨架（可 `Ctrl+Z`）。
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| Mixamo 前缀 | `mixamorig:` | 同场景多角色用 `mixamorig1:`；也可以不要前缀 |
+| 删除 MMD 控制骨 | 开 | IK / センター / 全ての親 这些 Mixamo 没有槽位的骨 |
+| 头发 / 裙子等骨骼名翻成英文 | 开 | 只是改名，骨骼本身保留 |
+| 同步重命名顶点组 | 开 | 关掉 = 蒙皮全丢，面板会警告 |
+| 被删骨骼的权重并入父骨 | 开 | 例：足D 的权重 → `LeftUpLeg` |
+| 摘掉 MMD Tools 追加变换 | 开 | 骨骼约束 + 驱动器 |
+| 先复制一份再改 | 开 | 保留原始 MMD 模型 |
+
+**转换后要上传 Mixamo / 做重定向时注意**：
+
+* 这一步**只改名字和层级**，不动静止姿势（MMD 是 A-pose、Mixamo 是 T-pose）。要上传 Mixamo
+  自动绑定时先摆成 T-pose；用 Mixamo 动画驱动 MMD 模型（重定向）时，静止姿势差异由重定向工具处理；
+* 骨架 / 物体缩放要是 1（不是 1 就 `Ctrl+A` 应用缩放），面板会提示；
+* `腕捩 / 手捩` 这类捩り骨会**保留**成额外骨（`arm_twist.L` …），它们跟着 `Arm` 继承；
+  Mixamo 不认这些槽位，但删了会掉体积，所以默认保留；
+* 这一步跑完，插件自己的「应用到骨架」仍然认 `mixamorig:LeftArm` 这类名字吗？**不认** ——
+  `自动匹配骨骼` 是按 Rigify / 元骨架的名字匹配的。要抓姿态请用 Rigify 骨架，别用转换后的 MMD 骨架。
+
+**真机实测**（仓库里那份「星穹铁道—流萤」PMX，2.2 MB，340 根骨）：
+
+| 项 | 结果 |
+| --- | --- |
+| 骨架 | `下半身 → mixamorig:Hips`、`上半身 → Spine`、`上半身2 → Spine1`，Spine 已挂到 Hips 下 |
+| 映射 | 65 根 → Mixamo（含 15 根手指、`右目/左目 → RightEye/LeftEye`、`右足先EX → ToeBase`）；总改名 292 根，**无重名** |
+| **头发** | 认出 **81 根**（`左後髪1-1 → back_hair1_1.L`、`左馬尾1-1 → ponytail1_1.L`、`中劉海1 → mid_bangs1`、`髮帶…`），**一根没删** |
+| **裙子** | 认出 **112 根**（`裙_0_0 → skirt_0_0` … 这款模型用的是中文「裙」），**一根没删** |
+| 控制骨 | 删 23 根（全ての親 / センター / グルーブ / 足IK親 / 足ＩＫ / つま先ＩＫ / 肩P / 肩C / ダミー / 腰キャンセル） |
+| 保留 | 317 根；只剩 19 根名字翻不了（`操作中心`、`腰`、`肩+`、`髪翼飾`…）→ 原样保留 |
+
+
+---
+
+
+### 5.3 Mixamo 骨架也能直接套姿态（`骨架标准 = Mixamo 标准`）
+
+抓到的姿态现在可以**直接写到 Mixamo 命名的骨架上**（比如用 5.2 转换出来的模型、或者从 Mixamo
+下载的 FBX）：面板 → **2. 目标骨架** → `骨架标准 = Mixamo 标准` → `自动匹配骨骼` → `应用到骨架`。
+
+| 角色 | Mixamo 骨 |
+| --- | --- |
+| 骨盆 / 根位移 | `mixamorig:Hips`（根位移也写这里） |
+| 脊椎 | `Spine` → `Spine1` → `Spine2`（有几根用几根） |
+| 颈 / 头 | `Neck` / `Head` |
+| 锁骨 / 大臂 / 小臂 / 手 | `{Side}Shoulder` / `{Side}Arm` / `{Side}ForeArm` / `{Side}Hand` |
+| 大腿 / 小腿 / 脚 / 前掌 | `{Side}UpLeg` / `{Side}Leg` / `{Side}Foot` / `{Side}ToeBase`（没有就 `Toe_End`） |
+| 手指 | `{Side}HandThumb1..3`、`HandIndex1..3`、`HandMiddle1..3`、`HandRing1..3`、`HandPinky1..3` |
+
+* **前缀自动探测**：`mixamorig:` / `mixamorig1:`（同场景多角色）/ 无前缀三种都认；
+* 不需要 IK / 快照那套（Mixamo 骨架没有 Rigify 的控制器），写入方式是纯 FK；
+* 点「新建元骨架 / 生成控制骨架」时会自动把 `骨架标准` 切回 `Rigify 标准`（那两根按钮造的是 Rigify 骨架）；
+* 实测（合成 Mixamo 骨架 + SAM 3D Body 的姿态）：`LeftArm` / `LeftForeArm` / `RightUpLeg` /
+  `RightLeg` / `Head` 与解算方向的误差 **0.00~0.02°**。
+
+### 5.4 一键给头发 / 裙子 / 飘带加 Goo Physics
+
+如果你装了 **Goo Physics**（模块名 `goo_physics`），面板里会多一个 **物理（Goo Physics）** 子面板：
+
+```
+选中骨架 → 勾「头发 / 裙子 / 飘带」→ 物理类型（自动 / 软体 / 布料 / Geo Nodes / 抖动）→ 一键加物理
+```
+
+它会：
+
+1. 按骨名认出三类骨（日文 / 中文 / 英文都认）：`髪 / 髮 / hair / 前髪 / 馬尾 / ponytail / 劉海`、
+   `スカート / 裙 / 裾 / skirt`、`リボン / 领结 / 飘带 / 尾巴 / 披风`；
+2. 按类型调 Goo Physics 的操作器（**类型/预设走它自己的偏好**，所以和它面板里点是一样的效果）：
+
+   | 我们的选项 | Goo 偏好 `gp_physics_type` | 操作器 |
+   | --- | --- | --- |
+   | 自动（头发 / 飘带） | `SIMP_SOFTBODY` | `goophys.add_soft_physics_to_selected` |
+   | 自动（裙子） | `CLOTH` | `goophys.add_cloth_physics_to_selected` |
+   | 软体 / 布料 / Geo Nodes / 抖动 | 对应值 | `add_*_physics_to_selected` |
+
+3. 只选这三类骨（不碰身体骨），并自动打开 Goo 的 **Physics Active**；
+4. 可选**给身体网格加碰撞体**（`goophys.add_collider`，用带骨架修改器的网格）；
+5. 回来**核对**：逐个骨骼检查 `gp_has_sb_physics / gp_has_cl_physics / gp_has_gn_physics /
+   gp_has_jg_physics`，面板会写「头发 3 根（软体链，已挂 3）；裙子 3 根（布料链，已挂 3）；碰撞体已生成」；
+6. 还有一个 **移除这些骨上的物理**（`goophys.remove_physics_from_selected`）。
+
+注意事项：
+* **Jiggle（抖动）只适合单根骨**，而且要求骨头是「断开父级 / 保持偏移」（Goo 自己的限制），
+  头发 / 裙子链请用软体或布料；
+* 预设、阻尼、风力、烘焙仍在 **Goo Physics 自己的面板**（`N` 面板 → Goo Animation Tools）里调；
+* 骨架必须能进 **Pose 模式**（Goo 的操作器读的是 pose 模式下的选骨），插件会自动切过去；
+* 没装 / 没启用 Goo Physics 时面板会直接说清楚（“装了但没启用” / “没有找到”），不会静默失败。
+
+---
+
+
 ## 6. 已知限制（单张图固有问题）
 
 > 下面大多是「关键点 + 单目深度」那条路的限制；`3D 来源 = SAM 3D Body`（见 **5.1**）时
 > 深度相关的几条不适用，但「单张图没有时序 / 遮挡时手指抖 / 骨架比例用你自己的」仍然成立。
+
+
 
 * **深度是模型估的，不是测的**：Depth Anything V2 属单目估计，严重遮挡（手挡在身前、肢体交叉）或大面积纯色背景会有误差，表现为**个别肢体前后略偏**。先点 **深度图预览窗口**（独立 Tk 页面：照片 / 深度灰度 / 深度伪彩 + 数值统计 + 方向核对）看质量：伪彩里**脸/手这些近的地方应该是蓝的、远背景是红的**（灰度图则是越白越远），再考虑换 fp32 档位、调 `透视强度`，或把 `深度来源` 改成 `骨长解算`
 * **整张图前后反了**：正常情况下方向由拟合自动决定，拟合分不出前后时由**物理判据**（人比背景近）兜底定符号；确实反了才勾 `反转深度方向`（1.3.1 起这个开关真的会把整套姿态前后翻过来；勾了以后就不用物理判据了，物理判据不适用时用它），勾错会自动退回骨长解算
@@ -562,6 +696,19 @@ blender.exe -b --factory-startup --python "dev_tests/test_sam3d_rig.py"
 python dev_tests/test_sam3d_inspect.py "D:\\code\\sam3d_out\\sam3d_0.npz"
 :: 1g) 真实结果端到端（写 Rigify + 导网格 + 渲染 output/sam3d_real/*.png）
 blender.exe -b --factory-startup --python "dev_tests/test_sam3d_real.py" -- "D:\\code\\sam3d_out\\sam3d_0.npz"
+:: 1h) MMD → Mixamo 纯逻辑自检（映射 / 层级 / 删除 / 头发裙子保留 / 幂等）—— 不需要 Blender
+python dev_tests/test_mmd_mixamo.py
+:: 1i) MMD → Mixamo 真骨架自检（合成 MMD 骨架 + 网格顶点组，跑操作器）
+blender.exe -b --factory-startup --python "dev_tests/test_mmd_mixamo_rig.py"
+:: 1j) MMD → Mixamo 真实 PMX 自检（直接读模型骨骼表；把 <model.pmx> 换成你的模型）
+python dev_tests/test_mmd_mixamo_pmx.py "<model.pmx>"
+:: 1k) Mixamo 标准骨架自检（映射 / 前缀 / 量尺寸 / 写姿态）
+blender.exe -b --factory-startup --python "dev_tests/test_mixamo_target.py"
+:: 1l) Goo Physics 一键加物理自检（需要装了 goo_physics 插件；没装会跳过）
+blender.exe -b --factory-startup --python "dev_tests/test_goo_physics.py"
+
+
+
 
 
 :: 2) Rigify 生成骨架自检：自动映射 + FK/IK + 变形位置还原
@@ -608,6 +755,8 @@ Pose Capture/
 │  ├─ reconstruction.py     2D→3D（深度模型 + 透视全局拟合，骨长解算兜底）
 │  ├─ sam3d.py              SAM 3D Body 适配层（MHR70 → 插件 recon；纯 numpy，可单测）
 │  ├─ sam3d_worker.py       外部 python 里跑的推理脚本（torch 只在那边加载）
+│  ├─ mmd_mixamo.py         MMD 骨骼 → Mixamo 改名 + 层级整理（头发 / 裙子骨保留；纯逻辑可单测）
+│  ├─ goo_physics.py        Goo Physics 桥接：一键给头发 / 裙子 / 飘带加物理（分类 + 选骨 + 核对）
 │  ├─ rigify_map.py         角色↔骨骼映射、静止尺寸测量
 │  ├─ rigify_limbs.py       Rigify 肢体 IK 控制器桥接（IK 直写计划 + IK->FK 快照兜底 + 显示同步）
 │  ├─ retarget.py           方向+扭转 → Pose 骨骼矩阵（默认直写 IK 控制器，可退回 FK + 快照）
@@ -625,6 +774,11 @@ Pose Capture/
 │  ├─ test_limb_logic.py    肢体写入纯逻辑自检（模式感知匹配 / IK 直写计划；普通 Python 可跑）
 │  ├─ test_sam3d.py         SAM 3D Body 适配层自检（相机投票 / MHR70→recon / 朝向 / 网格；普通 Python 可跑）
 │  ├─ test_sam3d_rig.py     SAM 3D Body → Rigify 自检（合成 MHR70 写姿态 + 网格导入对齐）
+│  ├─ test_mmd_mixamo.py    MMD → Mixamo 纯逻辑自检（映射 / 层级 / 保留头发裙子；普通 Python 可跑）
+│  ├─ test_mmd_mixamo_rig.py MMD → Mixamo 真骨架自检（合成 MMD 骨架 + 顶点组权重 + 复制模式）
+│  ├─ test_mmd_mixamo_pmx.py MMD → Mixamo 真实 PMX 自检（读骨骼表，不需要 Blender / MMD Tools）
+│  ├─ test_mixamo_target.py Mixamo 标准骨架自检（映射 / 前缀 / read_metrics / apply_pose）
+│  ├─ test_goo_physics.py   Goo Physics 一键加物理自检（分类 / 选骨 / 挂物理 / 碰撞体 / 移除）
 │  ├─ test_rigify_limbs.py  Rigify 肢体 IK 控制器自检（直写 + 快照退回 / 显示同步）
 │  ├─ _diag_ik_frames.py    Rigify 结构诊断（IK 控制器 / 极向目标 / 约束 vs FK 链；排错用）
 │  ├─ test_depth_view.py    深度预览自检（黑图回归 / PNG / 预览页面数据）

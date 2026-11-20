@@ -24,21 +24,27 @@ def check(ok, label, detail=""):
 
 def main():
     print("blender:", bpy.app.version_string)
-    # 不要先 disable：禁用会把这个插件的 AddonPreferences 一起清掉（SAM 路径就没了）
-    try:
-        bpy.ops.preferences.addon_enable(module=MODULE)
+    # 已经注册过就不要再 enable：重复 enable 会重载插件，把 AddonPreferences（SAM 路径）清空
+    already = hasattr(bpy.types, "PC_PT_main") and MODULE in bpy.context.preferences.addons
+    if already:
         error = ""
-    except Exception as exc:                            # noqa: BLE001
-        error = repr(exc)
+        print("  （启动时已自动注册，不重复 enable）")
+    else:
+        try:
+            bpy.ops.preferences.addon_enable(module=MODULE)
+            error = ""
+        except Exception as exc:                        # noqa: BLE001
+            error = repr(exc)
+        check(not error, "addon_enable 没抛异常", error)
 
-    check(not error, "addon_enable 没抛异常", error)
     check(MODULE in bpy.context.preferences.addons, "出现在偏好设置 addons 列表")
 
     package = sys.modules.get(MODULE)
     check(package is not None, "模块已导入",
           getattr(package, "__file__", "?"))
-    check(getattr(package, "__version__", None) == "1.4.0", "版本",
-          getattr(package, "__version__", "?"))
+    version = getattr(package, "__version__", None)
+    check(bool(version) and version.count(".") == 2, "版本号", version)
+
 
     check(hasattr(bpy.types, "PC_PT_main"), "面板类注册")
     check(hasattr(bpy.types, "PC_PT_mapping") and hasattr(bpy.types, "PC_PT_log"), "3 个面板")
@@ -58,8 +64,12 @@ def main():
         print("  sam3d_python = %s" % prefs.sam3d_python)
         print("  status = %s" % sam3d.status(sam3d.config_from_prefs(prefs))["message"])
         check(solver == "SAM3D", "自动解析到 SAM 3D Body", solver)
+        check(hasattr(bpy.ops.pose_capture, "mmd_to_mixamo"), "MMD → Mixamo 操作器")
+        check(hasattr(bpy.types, "PC_PT_mmd"), "MMD → Mixamo 面板")
+
         ui = import_module(MODULE + ".ui")
-        check(ui._version() == "1.4.0", "面板版本号", ui._version())
+        check(ui._version() == version, "面板版本号与 __version__ 一致", ui._version())
+
 
     print()
     if failures:
