@@ -8,7 +8,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProp
                        IntProperty, PointerProperty, StringProperty)
 from bpy.types import AddonPreferences, PropertyGroup
 
-from . import deps, depth, reconstruction, rigify_limbs, rigify_map, utils
+from . import deps, depth, reconstruction, rigify_limbs, rigify_map, sam3d, utils
 
 
 class PC_BoneMapping(PropertyGroup):
@@ -48,6 +48,24 @@ class PC_Settings(PropertyGroup):
     det_thr: FloatProperty(name="人体框置信度阈值", default=0.3, min=0.05, max=1.0)
 
     # ---------------- 姿态解算参数 ----------------
+    solver: EnumProperty(
+        name="3D 来源",
+        items=[("AUTO", "自动（装了 SAM 3D Body 就用）",
+                "配置好 SAM 3D Body 就用它（单图直接出 MHR 人体，含手指与脚），"
+                "否则退回下面的「深度来源」"),
+               ("SAM3D", "SAM 3D Body",
+                "强制用 SAM 3D Body：3D 关节由模型预测（带人体先验，前后关系 / 遮挡 / "
+                "侧身都比「关键点 + 单目深度」稳）。需要在偏好设置里配好外部 python"),
+               ("DEPTH", "DWPose + 深度模型",
+                "老路子：DWPose 133 点 + Depth Anything V2 逐点深度 + 透视全局拟合"),
+               ("BONE", "骨长解算（旧）",
+                "不想用深度时：正交投影 + 骨长约束，前后方向靠固定假设")],
+        default="AUTO")
+    sam3d_info: StringProperty(name="SAM 3D Body 状态", default="")
+    recon_source: StringProperty(
+        name="最近一次解算来源", default="",
+        description="上一次「应用到骨架」实际用的 3D 来源（SAM 3D Body / 深度模型 / 骨长解算）")
+
     facing: EnumProperty(
         name="人物朝向",
         items=[(key, reconstruction.FACING_LABELS[key], "")
@@ -167,6 +185,34 @@ class PC_Preferences(AddonPreferences):
     auto_install: BoolProperty(name="缺少依赖时自动安装", default=True)
     verbose: BoolProperty(name="输出详细日志", default=True)
 
+    # ---------------- SAM 3D Body（外部 python） ----------------
+    sam3d_python: StringProperty(
+        name="外部 python", subtype="FILE_PATH", default="",
+        description="装好 PyTorch + sam-3d-body 的 python.exe（按官方 INSTALL.md 建的 conda 环境）。"
+                    "Blender 自带 python 装不下 torch / detectron2，所以推理走子进程")
+    sam3d_repo: StringProperty(
+        name="代码目录", subtype="DIR_PATH", default="",
+        description="git clone 下来的 sam-3d-body 仓库根目录（里面有 sam_3d_body 这个包）")
+    sam3d_ckpt: StringProperty(
+        name="模型权重", subtype="DIR_PATH", default="",
+        description="官方下载的 checkpoints/sam-3d-body-* 目录（里面有 model.ckpt 与 "
+                    "assets/mhr_model.pt）；留空则从 HuggingFace 仓库在线加载")
+    sam3d_mhr: StringProperty(
+        name="MHR 资产（可选）", subtype="FILE_PATH", default="",
+        description="mhr_model.pt 的路径；留空会自动在权重目录的 assets/ 里找")
+    sam3d_hf: StringProperty(
+        name="HuggingFace 仓库", default="facebook/sam-3d-body-vith",
+        description="没有本地权重时用（需要先在 HuggingFace 上申请访问权限并 hf 登录）")
+    sam3d_device: EnumProperty(
+        name="设备", items=[("auto", "自动", ""), ("cuda", "CUDA", ""), ("cpu", "CPU", "")],
+        default="auto")
+    sam3d_body_only: BoolProperty(
+        name="只跑身体解码", default=False,
+        description="跳出手部解码器：更省显存 / 更快，但手指没有 3D 关键点（Rigify 手指骨不写）")
+    sam3d_timeout: IntProperty(name="超时（秒）", default=900, min=60, max=7200,
+                               description="子进程超时（首次加载模型 + CPU 推理会比较慢）")
+
+
     def draw(self, context):
         layout = self.layout
         status = deps.backend_status()
@@ -216,6 +262,28 @@ class PC_Preferences(AddonPreferences):
         row.operator("pose_capture.open_depth_view", text="打开预览窗口", icon="WINDOW")
         box.prop(self, "depth_view_python")
         box.label(text="Blender 自带 python 没有 tkinter，这里需要一个系统 Python", icon="INFO")
+
+        # ---------------- SAM 3D Body ----------------
+        box = layout.box()
+        box.label(text="SAM 3D Body（外部 python，推荐）", icon="OUTLINER_OB_ARMATURE")
+        config = sam3d.config_from_prefs(self)
+        info = sam3d.status(config)
+        box.label(text="状态：%s" % info["message"],
+                  icon="CHECKMARK" if info["available"] else "ERROR")
+        box.prop(self, "sam3d_python")
+        box.prop(self, "sam3d_repo")
+        box.prop(self, "sam3d_ckpt")
+        box.prop(self, "sam3d_mhr")
+        row = box.row(align=True)
+        row.prop(self, "sam3d_hf")
+        row.prop(self, "sam3d_device", text="")
+        row = box.row(align=True)
+        row.prop(self, "sam3d_body_only")
+        row.prop(self, "sam3d_timeout", text="超时")
+        box.operator("pose_capture.sam3d_check", text="检查环境（跑一次 --check）", icon="PLAY")
+        box.label(text="按官方 INSTALL.md 建好环境（torch + sam-3d-body），"
+                       "权重需在 HuggingFace 上申请访问", icon="INFO")
+
 
 
 # --------------------------------------------------------------------------- 工具函数
@@ -351,4 +419,36 @@ def resolve_providers():
         return filtered or None
     except Exception:  # noqa: BLE001
         return None
+
+
+
+# --------------------------------------------------------------------------- 3D 来源
+def resolve_solver(settings: PC_Settings) -> tuple[str, str]:
+    """把「3D 来源」解析成实际要跑的（``'SAM3D'`` / ``'DEPTH'`` / ``'BONE'``）+ 说明。
+
+    * ``AUTO``：SAM 3D Body 配置齐全就用它，否则按「深度来源」退回；
+    * ``SAM3D``：强制用（配置不全时返回 SAM3D + 说明，执行时会给出失败原因）；
+    * ``DEPTH`` / ``BONE``：老路子。
+
+    ``settings`` 允许是 None（注册阶段场景属性可能还没就绪）。
+    """
+    want = str(getattr(settings, "solver", "AUTO") or "AUTO").upper() if settings is not None else "AUTO"
+    depth_mode = getattr(settings, "depth_mode", "DEPTH") if settings is not None else "DEPTH"
+    if want in ("SAM3D", "AUTO"):
+        try:
+            config = sam3d.config_from_prefs(get_prefs())
+        except Exception:                        # noqa: BLE001  注册阶段 / 开发脚本里可能没有偏好项
+            config = {}
+        info = sam3d.status(config) if config else {"available": False,
+                                                    "message": "读不到偏好设置"}
+        if info["available"]:
+            return "SAM3D", ""
+        if want == "SAM3D":
+            return "SAM3D", "SAM 3D Body 不可用：%s" % info["message"]
+        return ("DEPTH" if depth_mode == "DEPTH" else "BONE"), \
+               "SAM 3D Body 不可用，已改用「深度来源」：%s" % info["message"]
+    if want == "DEPTH":
+        return "DEPTH", ""
+    return "BONE", ""
+
 

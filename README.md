@@ -3,9 +3,12 @@
 用一张人物图片，自动识别人体骨架，并把姿态转换成 **Blender Pose 模式下 Rigify 标准骨骼**可以直接使用的姿态数据。
 
 ```
-图片 ──► YOLOX-L 人体检测 ──► DWPose(dw-ll_ucoco_384) 133 关键点
-     ──► Depth Anything V2 深度图 ──► 透视相机 + 全局拟合（骨长解算兜底）
-     ──► Rigify 控制骨骼旋转(+可选根位移)
+（推荐）图片 ──► YOLOX-L 人框 ──► SAM 3D Body（外部 python）MHR70 三维人体（含手指/脚）
+      ──► 朝向/相机自动判定 ──► Rigify 控制骨骼旋转(+可选根位移 / 网格导入)
+
+（兜底）图片 ──► YOLOX-L 人体检测 ──► DWPose(dw-ll_ucoco_384) 133 关键点
+      ──► Depth Anything V2 深度图 ──► 透视相机 + 全局拟合（骨长解算兜底）
+      ──► Rigify 控制骨骼旋转(+可选根位移)
 ```
 
 * 已实测环境：**Blender 5.2.1 LTS（Windows，内置 Python 3.13 / numpy 2.3.4）**
@@ -141,6 +144,21 @@ python dev_tests/install_local.py --dry-run  # 只看会改哪些目录，不动
 > 所以“快照 0.000000 m”那个数其实是旧值 —— 真实关节位置差几毫米，膝盖最明显）。
 > 面板摘要会打印 `直写偏差 ≤ N mm`；`test_limb_logic` 新增按种类拆分的用例，
 > `test_rigify_limbs` 新增 `[3c] 腿 IK + 臂 FK`、`[3d] 停在 FK` 两组。
+> **1.4.0**：新增 **SAM 3D Body** 作为单图 3D 来源（`3D 来源 = 自动 / SAM 3D Body /
+> DWPose+深度 / 骨长解算`，见 **5.1**）。推理走**外部 python 子进程**
+> （`sam3d_worker.py`，torch / detectron2 不进 Blender），返回 MHR70 的 70 个 3D 关键点
+> + 相机 + 网格，再由 `sam3d.build_recon()` 换算成和 `reconstruction.reconstruct()`
+> **同结构**的 recon —— 重定向 / IK / 快照那一整套完全复用。相机 Y 轴方向与是否要加
+> `pred_cam_t` 由**2D 重投影投票**决定（不靠猜）；朝向由 3D 肩线 / 胯线自动判定（这项选项
+> 在 SAM 模式下不参与）；头向上轴用「鼻子-耳中点 × 眼线」并按解剖常数（鼻尖比耳道低
+> 10°）校正，平视时不会常年低头；手指/脚趾直接来自模型（`fingers` 不必再靠猜）。
+> 另加 **导入 SAM 3D Body 网格**（`pose_capture.import_sam3d_mesh`：与关节同一套变换，
+> 骨盆对齐到目标骨架、按腿长比例缩放，脚正好落在骨架地面）。自检：纯逻辑
+> `dev_tests/test_sam3d.py`（相机投票 / 角色映射 / 朝向归一 / 网格变换 / 与
+> `retarget.build_targets` 的接口），Blender 端 `dev_tests/test_sam3d_rig.py`
+> （合成 MHR70 → 写 Rigify：5 根骨骼方向差 0.0°、左大臂相对静止转 35.7°、网格脚底
+> 0.017 m = 骨架地面 0.017 m）。
+
 
 
 ---
@@ -252,7 +270,7 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
 | 2 检测 | 点 **检测姿态**（后台线程跑，不卡界面；按 ESC 可取消）。完成后会生成 `PoseCapture_Preview` 预览图，点旁边的小图标可推到图像编辑器查看骨架；深度模型就绪时会同时算出深度图（`PoseCapture_Depth`，**近=蓝、远=红**，灰度图则**越白=越远**）。旁边的 **深度图预览窗口** 会另开一个独立 Tk 页面，把照片 / 深度灰度 / 深度伪彩并排显示、打出数值统计、并给出**深度方向核对**（物理判据“人比背景近” vs 重建拟合方向，不一致会直接标出来）—— 判断“深度是不是真的算对了”用它最稳（不受 Blender 图像显示链路影响） |
 | 3 目标骨架 | 点 **新建元骨架** + **生成控制骨架** 得到标准 Rigify 人形骨架；也可以直接用你自己已经绑好的 Rigify 骨架（用吸管按钮绑定当前选中对象） |
 | 4 映射 | 点 **自动匹配骨骼**（生成骨架会自动认出 `spine_fk / upper_arm_fk.L / thigh_fk.L / neck / head / torso`，元骨架认出 `spine / spine.001 / upper_arm.L …`）。个别骨骼可以在“骨骼映射”子面板里手动指定 |
-| 5 参数 | 按需调姿态解算参数（见下表）。`深度来源` 默认用**深度模型**（前后方向来自像素）；想用旧方式就选 `骨长解算` |
+| 5 参数 | 按需调姿态解算参数（见下表）。`3D 来源` 默认 **自动**：配置好 SAM 3D Body 就用它（见 5.1），否则用 `深度来源` 的**深度模型**（前后方向来自像素）；想用旧方式就选 `骨长解算` |
 | 6 应用 | 点 **应用到骨架**：只写旋转（可选根位移），自动切到 Pose 模式方便查看；不满意可点 **清空 Pose** 重来 |
 
 > 生成骨架的手臂/腿默认挂在 **IK 控制器**（`hand_ik.L` / `foot_ik.R` …）上。
@@ -281,8 +299,10 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
 
 | 参数 | 说明 |
 | --- | --- |
+| **3D 来源** | `自动`（默认）：SAM 3D Body 配置齐全就用它，否则退回下面的「深度来源」；`SAM 3D Body`：单图直接出 MHR 人体（含手指 / 脚，带人体先验，见 **5.1**，需要外部 python 环境）；`DWPose + 深度模型`；`骨长解算` |
 | 人体框 / 关键点置信度阈值 | 检测的过滤阈值。检测不到人就降低人体框阈值；关键点乱飘就提高关键点阈值 |
-| **人物朝向** | 正面朝镜头 / 背面朝镜头 / 面朝画面左 / 右。决定“画面深处”与左右手的关系，选错会出现整体镜像或反向 |
+| **人物朝向** | 正面朝镜头 / 背面朝镜头 / 面朝画面左 / 右。决定“画面深处”与左右手的关系，选错会出现整体镜像或反向（`3D 来源 = SAM 3D Body` 时由 3D 肩线 / 胯线自动判定，这项不参与） |
+
 | **深度来源** | `深度模型`（默认）：用 Depth Anything V2 给每个关节解真实深度，前后方向来自像素；`骨长解算`：旧的 `dz=±√(L²-d²)` + 固定方向假设（兜底）；`压平到画面平面`：不做深度 |
 | 深度模型档位 / 透视强度 / 反转深度方向 | 档位在插件偏好设置里选（fp32 95MB 最准 / fp16 48MB / int8 27MB 最快）；透视强度 = 焦距系数 `f = 系数 × 图片长边`（偏平调大、偏夸张调小）；方向反了才勾“反转” |
 | 估算骨骼扭转(roll) | 用肩线、胯线、手臂弯曲轴对齐骨骼 roll，避免手臂/头部拧麻花。出问题可关掉或降低“扭转强度” |
@@ -332,9 +352,114 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
    * 老路径（`FK 骨骼` 模式、映射指向 FK 骨骼、或直写 / 复核没通过）：先把写到的肢体切到 FK，写旋转，再调用 Rigify 自带的 `pose.rigify_limb_ik2fk_<rig_id>` 快照把 IK 控制器对齐（骨骼方向与 FK 一致，关节位置差几毫米 —— IK 链自己的 hinge / stretch），最后按 `直写没成功时` 停在 IK（默认）或 FK。**快照失败**（生成脚本被删）时停在 FK
    * 两种路径都按最终的 IK / FK 状态同步控制器可见性（切 FK 藏 IK，反之亦然）
 
+### 5.1 SAM 3D Body 模式（推荐的单图 3D 来源）
+
+上面的 1~12 是「关键点 + 单目深度」那条路。1.4.0 起多了一条**把人当成生成式 3D 人体问题**
+的路子：`3D 来源 = SAM 3D Body` 时，3D 关节不由像素深度推，而是由 Meta 的
+[SAM 3D Body](https://github.com/facebookresearch/sam-3d-body)（MHR70，单图 → 参数化人体）
+直接预测 —— 前后关系、遮挡、侧身、透视缩短都带人体先验，代码里那些「深度方向猜错 / 手臂甩到
+背后 / 手部沿小臂硬拉」的补丁就不再需要了。
+
+```
+图片 ──► YOLOX + DWPose(133)          ← 仍然跑：2D 预览、人框、跟老路子共用一份缓存
+     ──► 人框交给外部 python ──► sam3d_worker.py ──► SAM 3D Body ──► npz
+         （70 点 3D / 70 点 2D / focal / cam_t / 网格顶点+面片）
+     ──► sam3d.build_recon()  ← MHR70 → 插件统一 recon（joints / refs / spine_points / fingers）
+     ──► retarget.apply_pose()  ← 完全复用（FK / IK / 快照 / 关键帧都一样）
+```
+
+**为什么走子进程**：SAM 3D Body 要 PyTorch / torchvision（想用它的自带检测器还要
+detectron2 / SAM3 / MoGe），这些既装不进也不该装进 Blender 自带的 python。插件只负责
+「拼参数 → 起子进程 → 读 npz」，模型加载和显存都在那个独立环境里，Blender 本体不受影响。
+
+**一次性准备**（按官方 `INSTALL.md`）：
+
+```bat
+:: 1) 建环境（Python 3.11），装 PyTorch（按 pytorch.org 选 CUDA 版）
+conda create -n sam_3d_body python=3.11 -y
+conda activate sam_3d_body
+pip install pytorch-lightning opencv-python yacs scikit-image einops timm dill pandas rich ^
+            hydra-core pyrootutils webdataset networkx==3.2.1 roma joblib seaborn appdirs ^
+            loguru optree fvcore pycocotools tensorboard huggingface_hub
+
+:: 2) 拿代码（插件要的是这个仓库的根目录）
+git clone https://github.com/facebookresearch/sam-3d-body
+
+:: 3) 拿权重（官方仓库是 gated：需要在 HF 上申请访问权限并登录）
+hf download facebook/sam-3d-body-dinov3 --local-dir checkpoints\sam-3d-body-dinov3
+::   没有权限时可以用公开镜像（文件字节数与官方完全一致，实测 2109129346 / 696110248 字节）
+::   python -c "from huggingface_hub import hf_hub_download as d; [d('Blendcap/sam-3d-body', f, local_dir=r'checkpoints\sam-3d-body-dinov3') for f in ('model_config.yaml','model.ckpt','assets/mhr_model.pt')]"
+
+```
+
+然后在 `编辑 > 偏好设置 > 附加组件 > Pose Capture > SAM 3D Body` 里填：
+
+| 项 | 填什么 |
+| --- | --- |
+| 外部 python | 上面那个环境的 `python.exe`（conda 的 `envs\sam_3d_body\python.exe`） |
+| 代码目录 | `sam-3d-body` 仓库根目录（里面有 `sam_3d_body/`） |
+| 模型权重 | `checkpoints\sam-3d-body-dinov3`（里面有 `model.ckpt` 与 `assets/mhr_model.pt`） |
+| HuggingFace 仓库 | 没有本地权重时用（默认 `facebook/sam-3d-body-vith`） |
+| 设备 | 有 N 卡选 CUDA；CPU 也能跑，就是慢 |
+
+点 **检查环境**（= 跑一次 `sam3d_worker.py --check`），成功会显示 `torch 版本 / CUDA / sam_3d_body 版本`。
+面板里 `3D 来源 = 自动` 时，配置齐全就用 SAM 3D Body，否则自动退回深度 / 骨长解算并把原因写进日志。
+
+**它是怎么换算成插件坐标的**（`pose_capture/sam3d.py`，纯 numpy，可脱离 Blender 单测）：
+
+| 步骤 | 做法 |
+| --- | --- |
+| 相机约定 | 用 `pred_keypoints_2d` 对「Y 上/下 × 是否加 `pred_cam_t`」做**重投影投票**，取误差最小的那一组（`_choose_camera`），结论写进日志（例如「Y 向下(OpenCV)，重投影误差 3.1 px」） |
+| 坐标 | 相机系 `(x, y, z)` → 插件系 `(x, z, -y)`（X 右 / Y 朝画面里 / Z 上） |
+| 朝向 | 由 3D 肩线 × 躯干轴算出人物正面，转到「角色面朝 -Y」，和 `reconstruction` 用同一个公式（所以「人物朝向」这项在 SAM 模式下不参与） |
+| 胸 / 颈 / 头 | 胸 = 肩峰中点（和颈根顺序冲突时取中点）、颈根 = MHR 的 `neck`；头骨起点取耳中点往颈轴 75% 处，头向上轴 =（鼻子 - 耳中点）× 眼线，**先按解剖常数把鼻子方向抬平 10°**（否则平视时 head 骨会常年低头 10°） |
+| 参照轴 | `hip_line` / `shoulder_line` / `eye_line`（符号统一到肩线）/ `armbend` = 大臂 × 小臂 / `kneebend` = 大腿 × 小腿 —— 与 `reconstruction._build_refs` 完全一致 |
+| 手指 / 脚趾 | MHR70 的「第三关节 → 第二 → 第一 → 指尖」正好是 Rigify 的 `*.01/.02/.03` 链，`fingers` 直接是 3D 的；脚掌用大脚趾尖当 `ball` |
+
+**网格**：点 **导入网格**（`pose_capture.import_sam3d_mesh`）会把 `pred_vertices` 导进场景 ——
+和骨骼用同一套变换；缩放按「网格高 → 骨架高」（和姿态无关，蹲着也准；没有网格时退回
+大腿+小腿骨长），骨盆水平对齐到目标骨架，**脚底贴骨架地面**。适合对着网格修姿态、或者拿它
+做深度 / 法线 ControlNet 的条件图。
+
+**耗时与缓存**（实测：RTX 4060 Laptop 8 GB / cu128 / 640×425 的 COCO 照片）：
+子进程每次都要重新加载 2.7 GB 权重，一次 `estimate()` 约 **90 s**，推理本身只占几秒。
+所以插件按 `(图片路径, 文件大小, 修改时间, 尺寸, 人物序号)` **缓存结果**：同一张图重检测 /
+重应用不会重新跑；换图或换人才会重新加载。想再快就得让 worker 常驻（目前没做）。
+
+
+**回退**：外部环境没配好、子进程报错、或者这次结果里没有 3D 点，都会**只影响这一次**——
+检测照常完成（2D 关键点 / 预览都有），应用姿态时退回深度 / 骨长解算，并在面板与日志里
+写清楚原因；不会出现「点了没反应」。
+
+**它的限制**（和深度那条路一样要心里有数）：
+
+* **单张图没有时序**：来回摆动的肢体仍可能被解成某一瞬间的合理姿态（但不会像深度那样把
+  手臂整条甩到身体后面）；
+* **遮挡 / 相切**：手贴脸、双手交叠时手指方向仍可能抖，`只跑身体解码` 可以跳过手部解码器；
+* **人体模型不同**：MHR ≠ SMPL-X，绝对尺寸看模型，插件只取「方向」；骨架比例始终用你自己的；
+* **穿模不会自动修**：网格是模型给的，手插进身体这类情况要手动调（或直接当造型用）。
+
+**真机实测**（2026-11-20，RTX 4060 Laptop 8 GB，torch 2.11.0+cu128，COCO `000000000785`）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 推理 | `process_one_image` 1 人，70 点 3D/2D + 18439 顶点 / 36874 面，GPU |
+| 相机投票 | **Y 向下(OpenCV) + 加 `pred_cam_t`**，重投影误差 **0.71 px** |
+| 骨长（模型预测） | 肩宽 0.334 / 大臂 0.275 / 小臂 0.251 / 大腿 0.423 / 小腿 0.386 / 躯干 0.560 m |
+| 左右对称 | 大臂 0.9% / 小臂 1.1% / 大腿 0.0% / 小腿 0.7% |
+| 朝向 | 自动判出 yaw **-59°**（照片里人是半侧身） |
+| 写进 Rigify | **53 根骨骼**（含 10 条手指链），骨骼方向与 recon 差 **0.00~0.02°** |
+| 网格导入 | 18439 顶点，脚底 0.017 m = 骨架地面 0.017 m（缩放 1.25） |
+| 耗时 | `estimate()` **92.5 s**（其中 ~85 s 是加载 2.7 GB 权重） |
+
+
 ---
 
+
 ## 6. 已知限制（单张图固有问题）
+
+> 下面大多是「关键点 + 单目深度」那条路的限制；`3D 来源 = SAM 3D Body`（见 **5.1**）时
+> 深度相关的几条不适用，但「单张图没有时序 / 遮挡时手指抖 / 骨架比例用你自己的」仍然成立。
 
 * **深度是模型估的，不是测的**：Depth Anything V2 属单目估计，严重遮挡（手挡在身前、肢体交叉）或大面积纯色背景会有误差，表现为**个别肢体前后略偏**。先点 **深度图预览窗口**（独立 Tk 页面：照片 / 深度灰度 / 深度伪彩 + 数值统计 + 方向核对）看质量：伪彩里**脸/手这些近的地方应该是蓝的、远背景是红的**（灰度图则是越白越远），再考虑换 fp32 档位、调 `透视强度`，或把 `深度来源` 改成 `骨长解算`
 * **整张图前后反了**：正常情况下方向由拟合自动决定，拟合分不出前后时由**物理判据**（人比背景近）兜底定符号；确实反了才勾 `反转深度方向`（1.3.1 起这个开关真的会把整套姿态前后翻过来；勾了以后就不用物理判据了，物理判据不适用时用它），勾错会自动退回骨长解算
@@ -429,6 +554,16 @@ blender.exe -b --factory-startup --python "dev_tests/test_face_head.py"
 blender.exe -b --factory-startup --python "dev_tests/_diag_hands.py" -- <图片路径> [人物序号]
 :: 1c) 肢体写入的纯逻辑自检（模式感知匹配 / IK 直写计划 / 直写触发）—— 普通 Python 就能跑
 python dev_tests/test_limb_logic.py
+:: 1d) SAM 3D Body 适配层自检（MHR70 -> recon / 相机投票 / 朝向归一 / 网格 / build_targets）—— 不需要 Blender
+python dev_tests/test_sam3d.py
+:: 1e) SAM 3D Body 路径的 Blender 自检（合成 MHR70 写进 Rigify 骨架 + 网格导入对齐）
+blender.exe -b --factory-startup --python "dev_tests/test_sam3d_rig.py"
+:: 1f) 真实结果数值检查（纯 numpy；参数是 worker 产出的 npz）
+python dev_tests/test_sam3d_inspect.py "D:\\code\\sam3d_out\\sam3d_0.npz"
+:: 1g) 真实结果端到端（写 Rigify + 导网格 + 渲染 output/sam3d_real/*.png）
+blender.exe -b --factory-startup --python "dev_tests/test_sam3d_real.py" -- "D:\\code\\sam3d_out\\sam3d_0.npz"
+
+
 :: 2) Rigify 生成骨架自检：自动映射 + FK/IK + 变形位置还原
 blender.exe -b --factory-startup --python "dev_tests/test_rigify_rig.py"
 :: 2a) Rigify 肢体 IK 控制器自检：解析链 / IK 直写 + 快照退回 / 控制器可用 / 显示同步
@@ -453,7 +588,7 @@ python dev_tests/test_tool.py
 blender.exe -b --factory-startup --python "dev_tests/test_installed.py"
 ```
 
-预期：`test_pipeline` 比例误差 <1%、四肢方向平均 ~3°/最大 <10°；`test_rigify_rig` 映射全 OK、画面内偏差 <25 像素；`test_rigify_limbs` 四条肢体链解析 OK、**直写的肢体**与 FK 的 DEF 关节最大位置差 ≤2 cm（实测手臂 4.4~6.5 mm；腿 11 mm 以上会被最终复核改成快照）、**退回快照 / 停在 FK 的肢体** ≤8 mm（实测腿 5.8 mm / 2.4 mm —— 旧文档里的 `0.000000 m` 是依赖图没推完读到的旧值）、**`腿 IK + 臂 FK` 混合模式**与 FK 结果 0.0000 m、控制器拖动有效、显示同步 OK；`test_limb_logic` 全部通过（不需要 Blender，含按种类拆分的匹配 / 直写计划 / 关键帧）；`test_depth` 三组合成深度图（线性 / 视差 / 前后取反）关节误差平均 ~4 mm、最大 ~10 mm，**大臂朝镜头伸**时手仍在身体前面且大臂长度回到骨长，**兜底**时也用深度图的符号（没深度图才退回老假设），**手部关键点**被用上、手指能生成；`test_depth_view` 写入的图不是全黑、PNG 回读正常、预览窗口能建起来；`test_retarget_roll` 手臂姿态矩阵误差 <15°（roll 对齐）；`test_onnx_end2end` 人体结构检查全 OK、写入一致性 0.00°、停在 IK 模式且控制器可拖；`test_installed` 显示“与仓库源码完全一致 ✓”且版本号与 `bl_info` 一致；“通过 ✓”。
+预期：`test_pipeline` 比例误差 <1%、四肢方向平均 ~3°/最大 <10°；`test_rigify_rig` 映射全 OK、画面内偏差 <25 像素；`test_rigify_limbs` 四条肢体链解析 OK、**直写的肢体**与 FK 的 DEF 关节最大位置差 ≤2 cm（实测手臂 4.4~6.5 mm；腿 11 mm 以上会被最终复核改成快照）、**退回快照 / 停在 FK 的肢体** ≤8 mm（实测腿 5.8 mm / 2.4 mm —— 旧文档里的 `0.000000 m` 是依赖图没推完读到的旧值）、**`腿 IK + 臂 FK` 混合模式**与 FK 结果 0.0000 m、控制器拖动有效、显示同步 OK；`test_limb_logic` 全部通过（不需要 Blender，含按种类拆分的匹配 / 直写计划 / 关键帧）；`test_depth` 三组合成深度图（线性 / 视差 / 前后取反）关节误差平均 ~4 mm、最大 ~10 mm，**大臂朝镜头伸**时手仍在身体前面且大臂长度回到骨长，**兜底**时也用深度图的符号（没深度图才退回老假设），**手部关键点**被用上、手指能生成；`test_depth_view` 写入的图不是全黑、PNG 回读正常、预览窗口能建起来；`test_retarget_roll` 手臂姿态矩阵误差 <15°（roll 对齐）；`test_onnx_end2end` 人体结构检查全 OK、写入一致性 0.00°、停在 IK 模式且控制器可拖；`test_installed` 显示“与仓库源码完全一致 ✓”且版本号与 `bl_info` 一致；“通过 ✓”。`test_sam3d` 六组全 OK（相机投票选中 OpenCV / 加 cam_t、骨盆换算、肩线 +X、头朝上、朝向归一后恒为 -Y、网格与关节同一套变换、`build_targets` 认得出 52 个目标）；`test_sam3d_rig` 显示「通过 (all OK)」（关键角色都写入、5 根骨骼方向差 0.0°、左大臂相对静止转 35.7°、网格最低 0.017 m = 骨架地面 0.017 m、骨盆对齐 0.124 m）。
 
 ---
 
@@ -471,6 +606,8 @@ Pose Capture/
 │  ├─ coco.py               COCO-WholeBody 133 点定义
 │  ├─ depth.py              深度模型（Depth Anything V2）推理 + 按关键点采样
 │  ├─ reconstruction.py     2D→3D（深度模型 + 透视全局拟合，骨长解算兜底）
+│  ├─ sam3d.py              SAM 3D Body 适配层（MHR70 → 插件 recon；纯 numpy，可单测）
+│  ├─ sam3d_worker.py       外部 python 里跑的推理脚本（torch 只在那边加载）
 │  ├─ rigify_map.py         角色↔骨骼映射、静止尺寸测量
 │  ├─ rigify_limbs.py       Rigify 肢体 IK 控制器桥接（IK 直写计划 + IK->FK 快照兜底 + 显示同步）
 │  ├─ retarget.py           方向+扭转 → Pose 骨骼矩阵（默认直写 IK 控制器，可退回 FK + 快照）
@@ -486,6 +623,8 @@ Pose Capture/
 │  ├─ test_depth.py         深度解算自检（合成真值姿态 + 合成深度图）
 │  ├─ test_face_head.py     头 / 脖子自检（五官坐标系 / 头基座来源 / head 方向与 eye_line / Rigify 扭转）
 │  ├─ test_limb_logic.py    肢体写入纯逻辑自检（模式感知匹配 / IK 直写计划；普通 Python 可跑）
+│  ├─ test_sam3d.py         SAM 3D Body 适配层自检（相机投票 / MHR70→recon / 朝向 / 网格；普通 Python 可跑）
+│  ├─ test_sam3d_rig.py     SAM 3D Body → Rigify 自检（合成 MHR70 写姿态 + 网格导入对齐）
 │  ├─ test_rigify_limbs.py  Rigify 肢体 IK 控制器自检（直写 + 快照退回 / 显示同步）
 │  ├─ _diag_ik_frames.py    Rigify 结构诊断（IK 控制器 / 极向目标 / 约束 vs FK 链；排错用）
 │  ├─ test_depth_view.py    深度预览自检（黑图回归 / PNG / 预览页面数据）

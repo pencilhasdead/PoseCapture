@@ -13,14 +13,36 @@ import numpy as np
 import bpy
 
 from . import (coco, deps, depth, depth_view, dwpose, imops, props, reconstruction,
-               retarget, rigify_limbs, rigify_map, utils)
+               retarget, rigify_limbs, rigify_map, sam3d, utils)
 
 # 模型 / 检测结果的会话缓存（不写入 .blend，重开文件后需要重新检测）
 _ESTIMATOR_CACHE = {"key": None, "obj": None}
 _DEPTH_CACHE = {"key": None, "obj": None}
 _RESULT = {"keypoints": None, "scores": None, "boxes": None, "box": None,
            "image_size": None, "path": None, "rgb": None, "person_index": 0,
-           "depth_map": None, "depth_size": None}
+           "depth_map": None, "depth_size": None, "sam3d": None, "sam3d_recon": None}
+# 上一次网格导入用的对齐（缩放 + 平移），演示/排错脚本可以直接读
+_LAST_SAM3D_ALIGN = {"scale": 1.0, "offset": [0.0, 0.0, 0.0]}
+# SAM 3D Body 结果缓存：键 = (图片, 尺寸, 人物序号)，值 = worker 的 npz 内容。
+# 每跑一次子进程都要重新加载 2.7 GB 权重（实测 90 s 上下），同一张图换参数重检测时直接复用。
+_SAM3D_CACHE = {}
+
+
+def _sam3d_cache_key(settings, rgb, person: int):
+    if getattr(settings, "image_source", "FILE") != "FILE":
+        return None                      # 图像数据块没有稳定的身份，不缓存
+    path = bpy.path.abspath(settings.image_filepath or "")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path).lower(), int(stat.st_size), int(stat.st_mtime),
+            int(rgb.shape[1]), int(rgb.shape[0]), int(person))
+
+
+
 
 
 # --------------------------------------------------------------------------- 公共工具
@@ -159,7 +181,8 @@ def depth_direction(depth_map: np.ndarray, box, image_size, recon=None) -> dict:
 
 def recon_summary(recon: dict) -> str:
     """把“用了哪种解算、拟合参数、兜底提示”写成一行，方便在面板/日志里核对。"""
-    labels = {"DEPTH": "深度模型", "BONE": "骨长解算", "FLAT": "压平"}
+    labels = {"DEPTH": "深度模型", "BONE": "骨长解算", "FLAT": "压平", "SAM3D": "SAM 3D Body"}
+
     mode = recon.get("mode", "?")
     parts = ["解算：%s" % labels.get(mode, mode)]
     info = recon.get("depth") or {}
@@ -750,9 +773,18 @@ class PC_OT_detect_pose(PC_ModalWorker):
         self._det_thr = float(settings.det_thr)
         self._score_thr = float(settings.score_thr)
         self._person = int(settings.person_index)
-        # 深度模型：只在“深度来源 = 深度模型”且模型就绪时才算
+
+        # 3D 来源：SAM 3D Body（外部子进程）还是老路子（DWPose + 深度）
+        self._solver, self._solver_note = props.resolve_solver(settings)
+        self._sam3d_config = sam3d.config_from_prefs(prefs)
+        self._sam3d_key = _sam3d_cache_key(settings, rgb, self._person)
+        if self._solver_note:
+            utils.warn(self._solver_note)
+
+
+        # 深度模型：只在“3D 来源 = 深度模型”且模型就绪时才算（SAM 3D Body 不需要它）
         self._depth_path = None
-        if settings.depth_mode == "DEPTH":
+        if self._solver == "DEPTH" and settings.depth_mode == "DEPTH":
             path, ready = props.resolve_depth_model_path()
             if ready:
                 self._depth_path = path
@@ -760,6 +792,7 @@ class PC_OT_detect_pose(PC_ModalWorker):
                 utils.warn("没有深度模型，本次用骨长解算兜底"
                            "（在插件偏好设置里可下载或导入深度模型）")
         return self.start_worker(context)
+
 
     def worker(self, emit, cancel):
         detector, pose_path = self._paths
@@ -773,6 +806,8 @@ class PC_OT_detect_pose(PC_ModalWorker):
         result["ok"] = result.get("keypoints") is not None
         result["depth_map"] = None
         result["depth_size"] = None
+        result["sam3d"] = None
+        result["sam3d_error"] = ""
 
         if result["ok"] and self._depth_path:
             if cancel():
@@ -787,7 +822,33 @@ class PC_OT_detect_pose(PC_ModalWorker):
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
                 emit(("log", "深度估计失败（本次改用骨长解算）：%s" % exc))
+
+        # SAM 3D Body：3D 由模型给，不需要深度图
+        if result["ok"] and self._solver == "SAM3D":
+            if cancel():
+                return {"ok": False, "message": "已取消"}
+            cached = _SAM3D_CACHE.get(self._sam3d_key) if self._sam3d_key else None
+            if cached is not None:
+                result["sam3d"] = cached
+                emit(("log", "SAM 3D Body：这张图 / 这个人物序号算过了，直接用缓存"))
+                return result
+            emit(("status", "SAM 3D Body 重建中…（要加载 2.7 GB 权重，首次/换图约 1~2 分钟）"))
+            try:
+                result["sam3d"] = sam3d.estimate(
+                    self._sam3d_config, self._rgb, bbox=result.get("box"),
+                    person_index=int(result.get("person_index", self._person)))
+                if self._sam3d_key:
+                    _SAM3D_CACHE[self._sam3d_key] = result["sam3d"]
+                vertices = result["sam3d"].get("vertices")
+                count = int(np.asarray(vertices).shape[0]) if vertices is not None else 0
+                emit(("log", "SAM 3D Body 完成（%d 个网格顶点）" % count))
+
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                result["sam3d_error"] = str(exc)
+                emit(("log", "SAM 3D Body 失败（本次退回深度 / 骨长解算）：%s" % exc))
         return result
+
 
     def on_done(self, context, result):
         settings = props.get_settings(context)
@@ -807,13 +868,25 @@ class PC_OT_detect_pose(PC_ModalWorker):
             "person_index": result.get("person_index", 0),
             "depth_map": result.get("depth_map"),
             "depth_size": result.get("depth_size"),
+            "sam3d": result.get("sam3d"),
+            "sam3d_recon": None,
         })
         settings.detected = True
         settings.person_index = int(result.get("person_index", 0))
         info = "检测到 %d 人，已选第 %d 人" % (len(result["boxes"]),
                                               result.get("person_index", 0) + 1)
+        sam = result.get("sam3d")
+        if sam is not None:
+            meta = sam.get("meta") or {}
+            info += "；SAM 3D Body：%s" % ("ok" if meta.get("ok") else "有结果")
+            settings.sam3d_info = "SAM 3D Body 完成（%d 人，%s）" % (
+                int(meta.get("people") or 1), meta.get("device") or "?")
+        elif result.get("sam3d_error"):
+            info += "；SAM 3D Body 失败"
+            settings.sam3d_info = "SAM 3D Body 失败：%s" % result["sam3d_error"][:200]
         settings.detect_info = info
         utils.log(info, "box =", result.get("box"))
+
 
         try:
             settings.preview_name = update_preview_image(
@@ -1064,35 +1137,80 @@ class PC_OT_apply_pose(bpy.types.Operator):
             return {"CANCELLED"}
 
         options = props.options_from_settings(settings)
-        # 深度方向：骨长拟合在“正面站、身体深度本来就扁”的照片上分不出前后（实测两种方向的
-        # 代价只差 0.1%），这时用物理判据（人比背景近，只看像素）钉住符号 —— 否则整套姿态会
-        # 前后反过来，表现就是“深度图里手在前面，应用后手却在身体后面”。
-        # 勾了“反转深度方向”就按用户的显式选择走（手动反转优先级最高，不用物理判据）。
-        if _RESULT.get("depth_map") is not None and not options.get("depth_flip"):
-            options = dict(options, depth_near_large=depth_orientation(
-                _RESULT["depth_map"], _RESULT.get("box"), _RESULT.get("image_size")))
-        recon = reconstruction.reconstruct(_RESULT["keypoints"], _RESULT["scores"],
-                                          metrics, _RESULT["image_size"], options,
-                                          depth_map=_RESULT.get("depth_map"),
-                                          depth_size=_RESULT.get("depth_size"))
-        if not recon.get("ok"):
-            self.report({"ERROR"}, "姿态重建失败：%s" % recon.get("message", ""))
-            return {"CANCELLED"}
+        solver, solver_note = props.resolve_solver(settings)
+        if solver_note:
+            utils.warn(solver_note)
+            settings.sam3d_info = solver_note
+        if solver == "BONE":
+            options = dict(options, depth_mode="BONE")
+
+        recon = None
+        if solver == "SAM3D":
+            data = _RESULT.get("sam3d")
+            if data is None:
+                # 绝不静默回退：这是“我明明配了 SAM 3D Body，效果却没变”的最常见原因
+                message = ("这次检测没有 SAM 3D Body 结果 —— 请重新点一次「检测姿态」"
+                           "（3D 来源 = SAM 3D Body 时检测阶段就会跑模型）；"
+                           "本次临时用深度 / 骨长解算")
+                utils.warn(message)
+                self.report({"WARNING"}, message)
+                settings.sam3d_info = message
+            else:
+                try:
+                    recon = sam3d.build_recon(data, options)
+                except Exception as exc:  # noqa: BLE001
+                    traceback.print_exc()
+                    message = "SAM 3D Body 结果换算失败（%s），本次临时用深度 / 骨长解算" % exc
+                    utils.warn(message)
+                    self.report({"WARNING"}, message)
+                    recon = None
+
+
+        if recon is None:
+            # 深度方向：骨长拟合在“正面站、身体深度本来就扁”的照片上分不出前后（实测两种方向的
+            # 代价只差 0.1%），这时用物理判据（人比背景近，只看像素）钉住符号 —— 否则整套姿态会
+            # 前后反过来，表现就是“深度图里手在前面，应用后手却在身体后面”。
+            # 勾了“反转深度方向”就按用户的显式选择走（手动反转优先级最高，不用物理判据）。
+            if _RESULT.get("depth_map") is not None and not options.get("depth_flip"):
+                options = dict(options, depth_near_large=depth_orientation(
+                    _RESULT["depth_map"], _RESULT.get("box"), _RESULT.get("image_size")))
+            recon = reconstruction.reconstruct(_RESULT["keypoints"], _RESULT["scores"],
+                                               metrics, _RESULT["image_size"], options,
+                                               depth_map=_RESULT.get("depth_map"),
+                                               depth_size=_RESULT.get("depth_size"))
+            if not recon.get("ok"):
+                self.report({"ERROR"}, "姿态重建失败：%s" % recon.get("message", ""))
+                return {"CANCELLED"}
         _RESULT["recon"] = recon
+        _RESULT["sam3d_recon"] = recon if recon.get("mode") == "SAM3D" else None
 
         solved_info = recon_summary(recon)
         utils.log(solved_info)
+        mode_labels = {"SAM3D": "SAM 3D Body", "DEPTH": "深度模型", "BONE": "骨长解算",
+                       "FLAT": "压平（无深度）"}
+        settings.recon_source = mode_labels.get(recon.get("mode"), str(recon.get("mode") or "?"))
+        if recon.get("mode") == "SAM3D":
+            settings.recon_source += "（%d 顶点 / 重投影 %.1f px）" % (
+                int(recon["sam3d"].get("mesh_vertices") or 0),
+                float(recon["sam3d"].get("reproj_error") or 0.0))
         for note in recon.get("notes") or []:
             utils.warn(note)
 
+
         # 深度方向核对：预览取色固定按物理判据（人比背景近），并用它反过来查拟合方向
-        direction = depth_direction(_RESULT.get("depth_map"), _RESULT.get("box"),
-                                    _RESULT.get("image_size"), recon)
+        # （SAM 3D Body 没有深度图，跳过这一段）
+        if _RESULT.get("depth_map") is not None:
+            direction = depth_direction(_RESULT.get("depth_map"), _RESULT.get("box"),
+                                        _RESULT.get("image_size"), recon)
+            settings.depth_direction = direction["text"]
+            if direction["warning"]:
+                utils.warn(direction["warning"])
+                settings.depth_direction += "；★ " + direction["warning"]
+        else:
+            direction = {"near_is_large": True, "text": "", "warning": ""}
+            settings.depth_direction = ""
         settings.depth_info = solved_info
-        settings.depth_direction = direction["text"]
-        if direction["warning"]:
-            utils.warn(direction["warning"])
-            settings.depth_direction += "；★ " + direction["warning"]
+
 
         # 用物理判据重画一次深度预览（不再跟随拟合方向，前后反了才看得出来）
         if (_RESULT.get("recon") or {}).get("depth") and _RESULT.get("depth_map") is not None:
@@ -1163,6 +1281,183 @@ class PC_OT_export_json(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+# --------------------------------------------------------------------------- SAM 3D Body
+class PC_OT_sam3d_check(PC_ModalWorker):
+    """在外部 python 里跑一次 --check：确认 torch / sam_3d_body 真的能导入。"""
+    bl_idname = "pose_capture.sam3d_check"
+    bl_label = "检查 SAM 3D Body 环境"
+
+    def execute(self, context):
+        prefs = props.get_prefs(context)
+        self._config = sam3d.config_from_prefs(prefs)
+        return self.start_worker(context)
+
+    def worker(self, emit, cancel):
+        emit(("status", "检查 SAM 3D Body 环境…（第一次导入 torch 要几秒）"))
+        return sam3d.probe(self._config)
+
+    def on_done(self, context, result):
+        settings = props.get_settings(context)
+        text = "SAM 3D Body 可用：%s / torch %s / %s / sam_3d_body %s" % (
+            result.get("python") or result.get("executable") or "?",
+            result.get("torch") or "?", "CUDA" if result.get("cuda") else "CPU",
+            result.get("version") or "?")
+        settings.sam3d_info = text
+        utils.log(text)
+        self.report({"INFO"}, text)
+        return {"FINISHED"}
+
+
+def _sam3d_material():
+    name = "SAM3DBody"
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    bsdf = material.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (0.65, 0.74, 0.86, 1.0)
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = 0.6
+    return material
+
+
+class PC_OT_import_sam3d_mesh(bpy.types.Operator):
+    """把 SAM 3D Body 的网格导进场景（和骨骼用同一套变换，骨盆对齐到目标骨架）。"""
+    bl_idname = "pose_capture.import_sam3d_mesh"
+    bl_label = "导入 SAM 3D Body 网格"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = props.get_settings(context)
+        data = _RESULT.get("sam3d")
+        if data is None:
+            self.report({"ERROR"},
+                        "还没有 SAM 3D Body 结果：先把「3D 来源」设成 SAM 3D Body 再点检测")
+            return {"CANCELLED"}
+
+        recon = _RESULT.get("sam3d_recon")
+        if not recon:
+            try:
+                recon = sam3d.build_recon(data, props.options_from_settings(settings))
+            except Exception as exc:  # noqa: BLE001
+                self.report({"ERROR"}, "SAM 3D Body 结果换算失败：%s" % exc)
+                return {"CANCELLED"}
+
+        try:
+            verts, faces = sam3d.mesh_arrays(data, recon)
+        except sam3d.Sam3DError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        scale, offset = self._align(settings, recon, verts)
+        verts = verts * scale + offset
+
+
+        mesh = bpy.data.meshes.new("SAM3DBody")
+        mesh.from_pydata([tuple(float(value) for value in vertex) for vertex in verts], [],
+                         [tuple(int(index) for index in face) for face in faces])
+        mesh.validate()
+        mesh.update()
+        for polygon in mesh.polygons:
+            polygon.use_smooth = True
+        obj = bpy.data.objects.new("SAM3DBody", mesh)
+        obj.data.materials.append(_sam3d_material())
+        collection = getattr(context, "collection", None) or context.scene.collection
+        collection.objects.link(obj)
+        try:
+            for other in context.selected_objects:
+                other.select_set(False)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+        except Exception:  # noqa: BLE001
+            pass
+        self.report({"INFO"}, "已导入 SAM 3D Body 网格（%d 顶点，缩放 %.3f）"
+                    % (len(verts), scale))
+        _LAST_SAM3D_ALIGN.update(scale=float(scale),
+                                 offset=[float(value) for value in offset])
+        return {"FINISHED"}
+
+
+    def _align(self, settings, recon, verts=None):
+        """把网格对齐到目标骨架：按「大腿 + 小腿」骨长缩放，骨盆水平对齐，脚底贴地面。
+
+        用骨长链而不是「骨盆 -> 脚底」的距离：蹲姿 / 劈叉时后者明显偏短，会把网格放大。
+        """
+        from mathutils import Vector
+
+        arm = getattr(settings, "armature", None)
+        if arm is None:
+            return 1.0, np.zeros(3, dtype=np.float64)
+        try:
+            bmap = props.mapping_from_settings(settings)
+            if not getattr(bmap, "roles", None):
+                # 还没点过「自动匹配骨骼」也能对齐：就地认一下骨架结构
+                bmap = rigify_map.auto_detect(arm, False)
+            metrics = rigify_map.read_metrics(arm, bmap)
+            pelvis = metrics.get("pelvis")
+        except Exception:  # noqa: BLE001
+            return 1.0, np.zeros(3, dtype=np.float64)
+
+        if pelvis is None:
+            return 1.0, np.zeros(3, dtype=np.float64)
+
+        rest = arm.matrix_world @ Vector(pelvis)
+        joints = recon["joints"]
+        floor = float(metrics.get("lowest_foot_z") or 0.0)
+
+        # 骨架总高（所有骨骼头/尾的最高点 - 地面）
+        height_rest = max((arm.matrix_world @ Vector(point)).z
+                          for bone in arm.data.bones
+                          for point in (bone.head_local, bone.tail_local)) - floor
+
+        # 缩放：优先「网格高 -> 骨架高」（和姿态无关，蹲着也比得准）；
+        # 没有网格时退回「大腿+小腿」骨长（比骨盆->脚底稳）
+        scale = 1.0
+        if verts is not None and len(verts) > 8:
+            span = float(np.ptp(np.asarray(verts, dtype=np.float64)[:, 2]))
+            if span > 1e-3 and height_rest > 1e-3:
+                scale = height_rest / span
+        if scale == 1.0:
+            total = 0.0
+            count = 0
+            for role in ("thigh.L", "shin.L", "thigh.R", "shin.R"):
+                name = bmap.get(role)
+                bone = arm.data.bones.get(name) if name else None
+                if bone is not None:
+                    total += float(bone.length)
+                    count += 1
+            leg_rest = total / max(count / 2.0, 1.0) or max(rest.z - floor, 1e-3)
+
+            def length(a, b):
+                return float(np.linalg.norm(np.asarray(joints[b], dtype=np.float64)
+                                            - np.asarray(joints[a], dtype=np.float64)))
+
+            leg_sam = float(np.mean([length("hip.%s" % side, "knee.%s" % side)
+                                     + length("knee.%s" % side, "ankle.%s" % side)
+                                     for side in ("L", "R")]))
+            scale = leg_rest / max(leg_sam, 1e-3)
+        scale = float(np.clip(scale, 0.5, 2.0))
+
+        sam_pelvis = np.asarray(joints["pelvis"], dtype=np.float64)
+        offset = np.array((float(rest.x) - sam_pelvis[0] * scale,
+                           float(rest.y) - sam_pelvis[1] * scale,
+                           0.0))
+        if verts is not None and len(verts):
+            # 脚底贴骨架地面（网格最低点就是脚底）
+            lowest = float((np.asarray(verts, dtype=np.float64) * scale)[:, 2].min())
+            offset[2] = floor - lowest
+        else:
+            # 没有网格：让骨盆落在骨架骨盆高度（地面信息在 metrics 里）
+            offset[2] = float(rest.z) - float(sam_pelvis[2]) * scale
+        return scale, offset
+
+
+
+        offset = np.asarray(rest, dtype=np.float64) - sam_pelvis * scale
+        return scale, offset
+
+
 CLASSES = (
     PC_OT_install_deps,
     PC_OT_download_models,
@@ -1181,7 +1476,10 @@ CLASSES = (
     PC_OT_sync_limb_display,
     PC_OT_apply_pose,
     PC_OT_export_json,
+    PC_OT_sam3d_check,
+    PC_OT_import_sam3d_mesh,
 )
+
 
 
 

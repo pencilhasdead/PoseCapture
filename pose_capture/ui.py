@@ -1,9 +1,22 @@
 """3D 视图侧栏（N 面板）界面。"""
 from __future__ import annotations
 
+import sys
+
 import bpy
 
 from . import deps, props, rigify_limbs, rigify_map
+
+
+def _version() -> str:
+    """版本号：扩展机制下 bl_info 会被 Blender 删掉，所以优先读 __version__。"""
+    package = sys.modules.get(__package__) or sys.modules.get("pose_capture")
+    version = getattr(package, "__version__", None)
+    if version:
+        return str(version)
+    parts = (getattr(package, "bl_info", {}) or {}).get("version")
+    return ".".join(str(part) for part in parts) if parts else "?"
+
 
 
 class PC_UL_bone_map(bpy.types.UIList):
@@ -47,12 +60,24 @@ class PC_PT_main(bpy.types.Panel):
 
         box = layout.box()
         col = box.column(align=True)
+        solver, solver_note = props.resolve_solver(settings)
+        version_text = "Pose Capture %s" % _version()
+        if solver == "SAM3D":
+            col.label(text="%s · 3D 来源：SAM 3D Body" % version_text,
+                      icon="CHECKMARK")
+        else:
+            col.label(text="%s · 3D 来源：%s（SAM 未启用）"
+                      % (version_text, "深度模型" if solver == "DEPTH" else "骨长解算"),
+                      icon="INFO")
         col.label(text="依赖：%s" % (backend_name or "未安装"),
                   icon="CHECKMARK" if backend_name else "ERROR")
         col.label(text="模型：%s" % ("已就绪" if models_ready else "未下载"),
                   icon="CHECKMARK" if models_ready else "ERROR")
         col.label(text="深度模型：%s" % ("已就绪" if depth_ready else "未下载"),
                   icon="CHECKMARK" if depth_ready else "INFO")
+        if solver_note:
+            col.label(text=solver_note[:100], icon="ERROR")
+
         if not (backend_name and models_ready):
             row = col.row(align=True)
             row.operator("pose_capture.install_deps", text="安装依赖", icon="IMPORT")
@@ -97,25 +122,38 @@ class PC_PT_main(bpy.types.Panel):
         box = layout.box()
         box.label(text="3. 姿态解算", icon="SETTINGS")
         col = box.column(align=True)
-        col.prop(settings, "facing")
-        col.prop(settings, "depth_mode")
-        if settings.depth_mode == "DEPTH":
-            col.label(text="深度模型：%s" % ("已就绪" if depth_ready else "未下载"),
-                      icon="CHECKMARK" if depth_ready else "ERROR")
-            if not depth_ready:
-                col.operator("pose_capture.download_depth_model",
-                             text="下载深度模型", icon="URL")
+        col.prop(settings, "solver")
+        solver = props.resolve_solver(settings)[0]
+        if solver == "SAM3D":
+            col.label(text="3D 关节与朝向都由 SAM 3D Body 预测（不需要深度图）", icon="INFO")
+            if settings.sam3d_info:
+                failed = ("失败" in settings.sam3d_info) or ("不可用" in settings.sam3d_info)
+                col.label(text=settings.sam3d_info[:110],
+                          icon="ERROR" if failed else "CHECKMARK")
             row = col.row(align=True)
-            row.prop(settings, "depth_focal")
-            row.prop(settings, "depth_flip", text="反转方向")
-            if settings.depth_preview_name:
+            row.operator("pose_capture.sam3d_check", text="检查环境", icon="PLAY")
+            row.operator("pose_capture.import_sam3d_mesh", text="导入网格", icon="MESH_DATA")
+        else:
+            col.prop(settings, "facing")
+            col.prop(settings, "depth_mode")
+            if settings.depth_mode == "DEPTH":
+                col.label(text="深度模型：%s" % ("已就绪" if depth_ready else "未下载"),
+                          icon="CHECKMARK" if depth_ready else "ERROR")
+                if not depth_ready:
+                    col.operator("pose_capture.download_depth_model",
+                                 text="下载深度模型", icon="URL")
                 row = col.row(align=True)
-                row.operator("pose_capture.show_depth", text="查看深度图",
-                             icon="IMAGE_REFERENCE")
-                row.operator("pose_capture.open_depth_view", text="深度图预览窗口",
-                             icon="WINDOW")
-        elif settings.depth_mode == "BONE":
-            col.label(text="旧方式：前后方向靠固定假设（手肘朝后/膝盖朝前）", icon="INFO")
+                row.prop(settings, "depth_focal")
+                row.prop(settings, "depth_flip", text="反转方向")
+                if settings.depth_preview_name:
+                    row = col.row(align=True)
+                    row.operator("pose_capture.show_depth", text="查看深度图",
+                                 icon="IMAGE_REFERENCE")
+                    row.operator("pose_capture.open_depth_view", text="深度图预览窗口",
+                                 icon="WINDOW")
+            elif settings.depth_mode == "BONE":
+                col.label(text="旧方式：前后方向靠固定假设（手肘朝后/膝盖朝前）", icon="INFO")
+
         row = col.row(align=True)
         row.prop(settings, "twist")
         row.prop(settings, "twist_blend", text="强度")
@@ -151,7 +189,12 @@ class PC_PT_main(bpy.types.Panel):
         row = col.row(align=True)
         row.prop(settings, "keyframe")
         row.label(text="当前帧 %d" % context.scene.frame_current)
+        if settings.recon_source:
+            is_sam = settings.recon_source.startswith("SAM 3D Body")
+            col.label(text="最近一次解算：%s" % settings.recon_source,
+                      icon="CHECKMARK" if is_sam else "INFO")
         box.operator("pose_capture.apply_pose", icon="CHECKMARK", text="应用到骨架")
+
 
 
 class PC_PT_mapping(bpy.types.Panel):

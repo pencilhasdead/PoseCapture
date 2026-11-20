@@ -14,7 +14,7 @@ if ADDON_PARENT not in sys.path:
     sys.path.insert(0, ADDON_PARENT)
 
 MODULES = ("utils", "coco", "imops", "dwpose", "deps", "rigify_map",
-           "reconstruction", "retarget", "props", "operators", "ui")
+           "reconstruction", "retarget", "sam3d", "props", "operators", "ui")
 
 
 def main():
