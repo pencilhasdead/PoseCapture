@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import unicodedata
 
 from mathutils import Matrix, Vector
 
@@ -89,6 +90,25 @@ MIXAMO_ROLES = {
 }
 # Mixamo 的脊椎链（顺序固定）：Spine -> Spine1 -> Spine2 -> Neck
 MIXAMO_SPINE = ("Spine", "Spine1", "Spine2")
+
+# 同一角色的“别名”后缀：Unity Humanoid 导出 / 各种重定向工具的写法。
+# 目标骨架只要沾其中一种，就能对上（Mixamo 优先，其次 Unity Humanoid）。
+MIXAMO_ALTERNATES = {
+    "hips": ("Hips", "Pelvis"),
+    "chest": ("Chest",),
+    "upper_chest": ("UpperChest",),
+    "upper_arm.{s}": ("{Side}UpperArm", "{Side}Arm"),
+    "forearm.{s}": ("{Side}LowerArm", "{Side}ForeArm"),
+    "hand.{s}": ("{Side}Hand",),
+    "shoulder.{s}": ("{Side}Shoulder", "{Side}Clavicle"),
+    "thigh.{s}": ("{Side}UpperLeg", "{Side}UpLeg"),
+    "shin.{s}": ("{Side}LowerLeg", "{Side}Leg"),
+    "foot.{s}": ("{Side}Foot",),
+    "toe.{s}": ("{Side}Toes", "{Side}ToeBase", "{Side}Toe_End"),
+    "neck": ("Neck",),
+    "head": ("Head",),
+}
+
 RIG_TYPES = ("RIGIFY", "MIXAMO")
 RIG_TYPE_LABELS = {"RIGIFY": "Rigify 标准", "MIXAMO": "Mixamo 标准"}
 
@@ -99,23 +119,62 @@ def detect_mixamo_prefix(names) -> str:
     for name in names:
         if name.endswith(":Hips") or name.endswith(":Spine"):
             return name[:name.rindex(":") + 1]
+        if ":" in name and name.rsplit(":", 1)[-1].lower() in ("hips", "spine"):
+            return name[:name.rindex(":") + 1]
     return ""
 
 
+
+def _mixamo_key(name: str) -> str:
+    """把骨名归一成“只有小写字母数字”：``mixamorig:LeftUpLeg.001`` -> ``leftupleg``。
+
+    这样真实 FBX / VRM / Unity 里那些 ``Armature|mixamorig:Hips``、``mixamorig_LeftArm``、
+    ``Hips.001``、大小写不一致的写法都能认出来。
+    """
+    text = unicodedata.normalize("NFKC", str(name)).lower()
+    if "|" in text:                       # FBX 常见 "Armature|mixamorig:Hips"
+        text = text.rsplit("|", 1)[-1]
+    text = "".join(char for char in text if char.isalnum())
+    return text
+
+
+def _strip_index(key: str) -> str:
+    """去掉 Blender 重名后缀（hips001 → hips），但保留 Spine1 / HandThumb1 这种数字。"""
+    if len(key) > 4 and key[-3:].isdigit() and key[-4] == "0":
+        return key[:-3]
+    return key
+
+
 def _mixamo_map(arm_obj, include_fingers: bool, names: list[str]) -> BoneMap:
-    """按 Mixamo 命名匹配角色（不做 IK 控制器那套）。"""
+    """按 Mixamo 命名匹配角色（对真实 FBX 的命名变体尽量宽容）。"""
     bmap = BoneMap()
     name_set = set(names)
     prefix = detect_mixamo_prefix(names)
 
+    exact = {_mixamo_key(name): name for name in names}
+    loose = {}
+    for name in names:
+        loose.setdefault(_strip_index(_mixamo_key(name)), name)
+    ordered = sorted(loose.items(), key=lambda item: len(item[0]))   # 短名优先
+
     def pick(*suffixes) -> str:
         for suffix in suffixes:
-            candidate = prefix + suffix
-            if candidate in name_set:
-                return candidate
+            for candidate in (prefix + suffix, suffix):
+                if candidate in name_set:
+                    return candidate
+            key = _mixamo_key(suffix)
+            if key in exact:
+                return exact[key]
+            if key in loose:
+                return loose[key]
+            # 归一化后以它结尾（吃掉 "Armature|mixamorig:" 之类的前缀）
+            for loose_key, name in ordered:
+                if loose_key.endswith(key):
+                    return name
         return ""
 
     hips = pick("Hips")
+
     if hips:
         bmap.set("hips", hips)
         bmap.set("root", hips)          # Mixamo 的根位移就写在 Hips 上
@@ -125,27 +184,39 @@ def _mixamo_map(arm_obj, include_fingers: bool, names: list[str]) -> BoneMap:
     for role, suffix in MIXAMO_ROLES.items():
         if role in ("hips",):
             continue
+        alternates = MIXAMO_ALTERNATES.get(role, ())
         if "{s}" in role:
             if not include_fingers and any(role.startswith(f) for f in FINGERS):
                 continue
             for side, label in (("L", "Left"), ("R", "Right")):
                 rid = role.format(s=side)
-                name = pick(suffix.replace("{Side}", label))
-                if not name and suffix.endswith("ToeBase"):
+                name = ""
+                for candidate in (suffix,) + tuple(alternates):
+                    name = pick(candidate.replace("{Side}", label))
+                    if name:
+                        break
+                if not name and "ToeBase" in suffix:
                     name = pick(suffix.replace("{Side}", label).replace("ToeBase", "Toe_End"))
                 if name:
                     bmap.set(rid, name)
                 else:
                     bmap.missing.append(rid)
         else:
-            name = pick(suffix)
+            name = ""
+            for candidate in (suffix,) + tuple(alternates):
+                name = pick(candidate)
+                if name:
+                    break
             if name:
                 bmap.set(role, name)
             else:
                 bmap.missing.append(role)
 
     spine_chain = [pick(suffix) for suffix in MIXAMO_SPINE]
+    if not any(spine_chain):                     # Unity Humanoid：Spine / Chest / UpperChest
+        spine_chain = [pick(name) for name in ("Spine", "Chest", "UpperChest")]
     spine_chain = [name for name in spine_chain if name]
+
     if not spine_chain and hips:
         # 只有 Hips 没有 Spine：至少让“骨盆 -> 胸”这一段有东西量
         spine_chain = [hips]

@@ -951,6 +951,22 @@ def _resolve_armature(settings, context):
     return arm_obj
 
 
+def _auto_rig_type(settings, arm_obj, bmap):
+    """当前“骨架标准”一个角色都对不上时，自动切到另一边（Mixamo ↔ Rigify）。"""
+    if len(bmap.roles) >= 8:
+        return bmap
+    other = "MIXAMO" if settings.rig_type != "MIXAMO" else "RIGIFY"
+    alt = rigify_map.auto_detect(arm_obj, bool(settings.fingers),
+                                 props.limb_mode_map(settings), other)
+    if len(alt.roles) > len(bmap.roles) + 2:
+        settings.rig_type = other
+        utils.warn("骨架标准自动切成 %s（那边认到 %d 个角色，这边只有 %d 个）"
+                   % (rigify_map.RIG_TYPE_LABELS.get(other, other),
+                      len(alt.roles), len(bmap.roles)))
+        return alt
+    return bmap
+
+
 class PC_OT_use_active_armature(bpy.types.Operator):
     bl_idname = "pose_capture.use_active_armature"
     bl_label = "使用当前选中骨架"
@@ -962,7 +978,9 @@ class PC_OT_use_active_armature(bpy.types.Operator):
             self.report({"ERROR"}, "请先选中一个骨架对象")
             return {"CANCELLED"}
         settings.armature = obj
-        bmap = rigify_map.auto_detect(obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
+        bmap = rigify_map.auto_detect(obj, settings.fingers,
+                                      props.limb_mode_map(settings), settings.rig_type)
+        bmap = _auto_rig_type(settings, obj, bmap)
         props.sync_mapping_to_settings(settings, bmap)
         self.report({"INFO"}, "已绑定 %s，映射角色 %d 个（缺失 %d 个）"
                     % (obj.name, len(bmap.roles), len(bmap.missing)))
@@ -979,12 +997,16 @@ class PC_OT_auto_map(bpy.types.Operator):
         if arm_obj is None:
             self.report({"ERROR"}, "请先指定目标骨架")
             return {"CANCELLED"}
-        bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
+        bmap = rigify_map.auto_detect(arm_obj, settings.fingers,
+                                      props.limb_mode_map(settings), settings.rig_type)
+        bmap = _auto_rig_type(settings, arm_obj, bmap)
         props.sync_mapping_to_settings(settings, bmap)
         utils.log("骨骼映射：", bmap.roles)
         utils.log("未找到：", bmap.missing)
-        self.report({"INFO"}, "匹配到 %d 个角色，缺少 %d 个（可手动在下拉框里指定）"
-                    % (len(bmap.roles), len(bmap.missing)))
+        self.report({"INFO"}, "匹配到 %d 个角色（%s），缺少 %d 个（可手动在下拉框里指定）"
+                    % (len(bmap.roles), rigify_map.RIG_TYPE_LABELS.get(settings.rig_type,
+                                                                      settings.rig_type),
+                       len(bmap.missing)))
         return {"FINISHED"}
 
 
@@ -1051,7 +1073,53 @@ class PC_OT_generate_rig(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PC_OT_diag_report(bpy.types.Operator):
+    """把骨架 / 物理的实际状态打出来：为什么匹配不到骨、哪些角色缺。"""
+    bl_idname = "pose_capture.diag_report"
+    bl_label = "诊断（骨架 + 物理）"
+
+    def execute(self, context):
+        settings = props.get_settings(context)
+        arm_obj = _resolve_armature(settings, context)
+        if arm_obj is None or arm_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "先选中一根骨架（或在上方面板指定目标骨架）")
+            return {"CANCELLED"}
+
+        names = [bone.name for bone in arm_obj.data.bones]
+        lines = ["骨架 %s：%d 根骨，当前标准 %s"
+                 % (arm_obj.name, len(names), settings.rig_type)]
+        lines.append("骨名样例：" + "、".join(names[:10]))
+        lines.append("Mixamo 前缀：%r" % rigify_map.detect_mixamo_prefix(names))
+
+        counts = {}
+        for rig_type in ("RIGIFY", "MIXAMO"):
+            bmap = rigify_map.auto_detect(arm_obj, bool(settings.fingers),
+                                          props.limb_mode_map(settings), rig_type)
+            counts[rig_type] = len(bmap.roles)
+            missing = "、".join(bmap.missing[:8]) + ("…" if len(bmap.missing) > 8 else "")
+            lines.append("%s 标准：匹配 %d 个角色%s"
+                         % ("Rigify" if rig_type == "RIGIFY" else "Mixamo", len(bmap.roles),
+                            ("，缺 " + missing) if bmap.missing else "（全齐）"))
+
+        best = "MIXAMO" if counts["MIXAMO"] > counts["RIGIFY"] else "RIGIFY"
+        if best != settings.rig_type and counts[best] > counts[settings.rig_type]:
+            lines.append("建议：把「骨架标准」切成 %s（那边能对上 %d 个角色）"
+                         % ("Mixamo 标准" if best == "MIXAMO" else "Rigify 标准", counts[best]))
+
+        groups = goo_physics.bones_by_kind(arm_obj)
+        lines.append("物理可加骨：头发 %d / 裙子 %d / 飘带 %d"
+                     % (len(groups["hair"]), len(groups["skirt"]), len(groups["ribbon"])))
+        lines.append(goo_physics.status()["message"])
+
+        for line in lines:
+            utils.log(line)
+        settings.diag_result = "；".join(lines[:3])
+        self.report({"INFO"}, "诊断已输出到日志面板（共 %d 行）" % len(lines))
+        return {"FINISHED"}
+
+
 class PC_OT_reset_pose(bpy.types.Operator):
+
     bl_idname = "pose_capture.reset_pose"
     bl_label = "清空被写入的 Pose"
     bl_options = {"REGISTER", "UNDO"}
@@ -1133,9 +1201,12 @@ class PC_OT_apply_pose(bpy.types.Operator):
         remap = (not bmap.roles or (stale and settings.auto_map_on_apply)
                  or (switched and settings.auto_map_on_apply))
         if remap:
-            bmap = rigify_map.auto_detect(arm_obj, settings.fingers, props.limb_mode_map(settings), settings.rig_type)
+            bmap = rigify_map.auto_detect(arm_obj, settings.fingers,
+                                          props.limb_mode_map(settings), settings.rig_type)
+            bmap = _auto_rig_type(settings, arm_obj, bmap)
             props.sync_mapping_to_settings(settings, bmap)
             utils.log("已重新自动匹配骨骼名")
+
 
         metrics = rigify_map.read_metrics(arm_obj, bmap)
         if metrics.get("errors"):
@@ -1474,8 +1545,12 @@ def _selected_armature(context, settings):
 
 
 def _duplicate_model(context, arm):
-    """连同网格复制一份（网格的 Armature 修改器会自动指向新骨架）。"""
+    """连同网格复制一份（网格的 Armature 修改器会自动指向新骨架）。
+
+    返回 ``(新骨架, 原模型的对象列表)`` —— 后者用来“转换后删掉原 PMX 模型”。
+    """
     meshes = mmd_mixamo.find_meshes(arm)
+    sources = [arm] + list(meshes)
     for obj in list(context.selected_objects):
         obj.select_set(False)
     arm.select_set(True)
@@ -1485,11 +1560,74 @@ def _duplicate_model(context, arm):
     bpy.ops.object.duplicate(linked=False)
     duplicated = context.view_layer.objects.active
     if duplicated is not None and duplicated.type == "ARMATURE":
-        return duplicated
-    return arm
+        return duplicated, sources
+    return arm, sources
+
+
+
+def _delete_objects(objects) -> str:
+    """删掉一批对象（连它们的网格 / 骨架数据一起清掉），返回一句说明。"""
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+    names = [obj.name for obj in objects if obj is not None]
+
+    for obj in list(objects):
+        if obj is None:
+            continue
+        data = getattr(obj, "data", None)
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except (ReferenceError, RuntimeError):
+            continue
+        if data is not None and data.users == 0:
+            if isinstance(data, bpy.types.Mesh):
+                bpy.data.meshes.remove(data)
+            elif isinstance(data, bpy.types.Armature):
+                bpy.data.armatures.remove(data)
+    return "%d 个对象：%s" % (len(names), "、".join(names[:3]) + ("…" if len(names) > 3 else ""))
+
+
+def _strip_copy_suffix(name: str) -> str:
+    """``MMD_Origin.001`` -> ``MMD_Origin``（Blender 复制时的重名后缀）。"""
+    if len(name) > 4 and name[-4] == "." and name[-3:].isdigit():
+        return name[:-4]
+    return name
+
+
+def _restore_names(arm) -> None:
+    """删掉原模型后，把 ``.001`` 这类后缀还回去（骨架 / 网格 / 数据块 / 动作都试一遍）。"""
+    targets = [arm] + list(mmd_mixamo.find_meshes(arm))
+    for obj in targets:
+        base = _strip_copy_suffix(obj.name)
+        if base != obj.name and base not in bpy.data.objects:
+            try:
+                obj.name = base
+            except (RuntimeError, TypeError):
+                pass
+        data = getattr(obj, "data", None)
+        if data is None:
+            continue
+        data_base = _strip_copy_suffix(data.name)
+        if data_base != data.name:
+            try:
+                data.name = data_base
+            except (RuntimeError, TypeError):
+                pass
+        action = getattr(getattr(obj, "animation_data", None), "action", None)
+        if action is not None:
+            action_base = _strip_copy_suffix(action.name)
+            if action_base != action.name:
+                try:
+                    action.name = action_base
+                except (RuntimeError, TypeError):
+                    pass
 
 
 class PC_OT_mmd_to_mixamo(bpy.types.Operator):
+
     """把 MMD 骨骼改成 Mixamo 命名（保留头发 / 裙子等非标准骨骼）。"""
     bl_idname = "pose_capture.mmd_to_mixamo"
     bl_label = "MMD 骨骼 → Mixamo"
@@ -1508,7 +1646,8 @@ class PC_OT_mmd_to_mixamo(bpy.types.Operator):
         plan = mmd_mixamo.plan_conversion(
             bones, parents, prefix=settings.mmd_prefix,
             cleanup=bool(settings.mmd_cleanup),
-            translate_extras=bool(settings.mmd_translate_extras))
+            translate_extras=bool(settings.mmd_translate_extras),
+            simplify=bool(settings.mmd_simplify))
         if not plan["rename"] and not plan["delete"]:
             message = "这个骨架看起来不是 MMD 骨架（一个标准 MMD 骨名都没认出来）"
             self.report({"WARNING"}, message)
@@ -1516,8 +1655,9 @@ class PC_OT_mmd_to_mixamo(bpy.types.Operator):
             return {"CANCELLED"}
 
         source = arm
+        sources = []
         if settings.mmd_duplicate:
-            arm = _duplicate_model(context, arm)
+            arm, sources = _duplicate_model(context, arm)
 
         if settings.mmd_strip_helpers:
             removed = mmd_mixamo.strip_mmd_helpers(arm)
@@ -1536,11 +1676,26 @@ class PC_OT_mmd_to_mixamo(bpy.types.Operator):
         if removed["constraints"] or removed["drivers"]:
             parts.append("摘掉约束 %d / 驱动器 %d" % (removed["constraints"], removed["drivers"]))
         if settings.mmd_duplicate:
-            parts.append("基于 %s（原模型保留）" % source.name)
+            if settings.mmd_delete_source and sources:
+                parts.append("原 PMX 模型已删除（%s）" % _delete_objects(sources))
+                _restore_names(arm)     # 删掉原模型后把 .001 后缀还回去
+            else:
+                parts.append("基于 %s（原模型保留）" % source.name)
+
+
+        settings.armature = arm
+        settings.rig_type = "MIXAMO"        # 刚转成 Mixamo 命名，姿态检测直接按它匹配
+        if settings.limb_mode != "FK":
+            settings.limb_mode = "FK"       # Mixamo 骨架没有 Rigify 的 IK 控制器
+        bmap = rigify_map.auto_detect(arm, bool(settings.fingers),
+                                      props.limb_mode_map(settings), "MIXAMO")
+        props.sync_mapping_to_settings(settings, bmap)
+        parts.append("骨骼映射 %d 个角色" % len(bmap.roles))
+
         summary = "；".join(parts)
         settings.mmd_result = summary
-        settings.armature = arm
         utils.log(summary)
+
         for note in plan.get("notes") or []:
             utils.warn(note)
         for warning in report.get("warnings") or []:
@@ -1589,7 +1744,10 @@ class PC_OT_goo_physics_add(bpy.types.Operator):
             return {"CANCELLED"}
 
         report = goo_physics.apply(context, arm, kinds, settings.goo_type,
-                                   bool(settings.goo_collider))
+                                   bool(settings.goo_collider),
+                                   int(settings.goo_max_bones),
+                                   bool(settings.goo_selected_only))
+
         summary = goo_physics.summarize(report)
         settings.goo_result = summary
         utils.log(summary)
@@ -1633,6 +1791,7 @@ CLASSES = (
     PC_OT_open_depth_view,
     PC_OT_use_active_armature,
     PC_OT_auto_map,
+    PC_OT_diag_report,
     PC_OT_add_metarig,
     PC_OT_generate_rig,
     PC_OT_reset_pose,

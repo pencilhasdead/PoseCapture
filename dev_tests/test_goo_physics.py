@@ -107,6 +107,17 @@ def test_classify():
                                   ["髪1", "髪2", "髪3"]) == 1, "头发算 1 条链")
 
 
+def set_selected(arm, names):
+    """Blender 5 起用 ``PoseBone.select``，更早的版本用 ``Bone.select``。"""
+    names = set(names)
+    for pose_bone in arm.pose.bones:
+        state = pose_bone.name in names
+        if bpy.app.version[0] >= 5:
+            pose_bone.select = state
+        else:
+            pose_bone.bone.select = state
+
+
 def test_apply():
     print("\n[2] 一键加物理")
     bpy.ops.wm.read_factory_settings(use_empty=True)   # 注意：这会重置插件，之后要重新启用
@@ -149,7 +160,49 @@ def test_apply():
     check("头发" in text and "裙子" in text, "面板结果文案", text[:70])
     check(goo_physics.goo_prefs().gp_physics_active is True, "Physics Active 已打开")
 
-    print("\n[3] 一键移除")
+    print("\n[3] 每类上限 / 只对选中骨加物理")
+    arm = build_rig()
+    build_mesh(arm)
+    settings.armature = arm
+    settings.goo_hair = True
+    settings.goo_skirt = True
+    settings.goo_ribbon = True
+    settings.goo_type = "AUTO"
+    settings.goo_collider = False
+    settings.goo_max_bones = 2
+    settings.goo_selected_only = False
+    result = bpy.ops.pose_capture.goo_physics_add()
+    check(result == {"FINISHED"}, "上限模式返回 FINISHED", str(result))
+    hair_on = [name for name in ("髪1", "髪2", "髪3") if has_flag(arm, name, "gp_has_sb_physics")]
+    check(len(hair_on) == 2, "头发只加了前 2 根（上限）", str(hair_on))
+    check("超过上限" in (settings.goo_result or ""), "结果里提示了上限",
+          (settings.goo_result or "")[:70])
+    bpy.ops.pose_capture.goo_physics_remove()
+
+    print("\n[4] 只对选中骨（自定义骨）")
+    settings.goo_max_bones = 64
+    settings.goo_selected_only = True
+    settings.goo_type = "SOFT"
+    bpy.context.view_layer.objects.active = arm
+    arm.select_set(True)
+    if arm.mode != "POSE":
+        bpy.ops.object.mode_set(mode="POSE")
+    set_selected(arm, ("髪1", "髪2"))
+    arm.data.bones.active = arm.data.bones["髪1"]
+    bpy.context.view_layer.update()
+    result = bpy.ops.pose_capture.goo_physics_add()
+    check(result == {"FINISHED"}, "选中骨模式返回 FINISHED", str(result))
+    check(has_flag(arm, "髪1", "gp_has_sb_physics") and has_flag(arm, "髪2", "gp_has_sb_physics"),
+          "只给选中的两根头发加了物理")
+    check(not has_flag(arm, "髪3", "gp_has_sb_physics"), "没选中的骨没被加")
+    check(not has_flag(arm, "裙_0_0", "gp_has_cl_physics"), "裙子没被顺手加（只处理选中骨）")
+    bpy.ops.pose_capture.goo_physics_remove()
+
+    print("\n[5] 一键移除")
+    settings.goo_selected_only = False
+    settings.goo_max_bones = 64
+    result = bpy.ops.pose_capture.goo_physics_add()
+    check(result == {"FINISHED"}, "全量再加一次", str(result))
     result = bpy.ops.pose_capture.goo_physics_remove()
     check(result == {"FINISHED"}, "移除返回 FINISHED", str(result))
     left = [name for name, *_rest in SKELETON
@@ -161,8 +214,14 @@ def test_apply():
 
 def main():
     print("Goo Physics 一键加物理自检")
-    test_classify()
-    test_apply()
+    try:
+        test_classify()
+        test_apply()
+    except Exception:  # noqa: BLE001  出错要看得见，不能静默退出
+        import traceback
+
+        traceback.print_exc()
+        failures.append("异常中断")
     print()
     if failures:
         print("!! 失败 %d 项：%s" % (len(failures), ", ".join(failures)))

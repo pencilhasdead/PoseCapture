@@ -92,15 +92,19 @@ def build_rig(name="MMD"):
     arm.select_set(True)
     bpy.ops.object.mode_set(mode="EDIT")
     made = {}
+    pending = []
     for bone_name, parent, head, tail in SKELETON:
         bone = armature.edit_bones.new(bone_name)
         bone.head = head
         bone.tail = tail
-        if parent:
-            bone.parent = made[parent]
         made[bone_name] = bone
+        if parent:
+            pending.append((bone_name, parent))
+    for bone_name, parent in pending:          # 表里的顺序可以随便写，父级后建也行
+        made[bone_name].parent = made[parent]
     bpy.ops.object.mode_set(mode="OBJECT")
     return arm
+
 
 
 def build_mesh(arm, name="MMD_Mesh"):
@@ -137,8 +141,10 @@ def weight_of(obj, group_name, vertex_index):
     return 0.0
 
 
-def run_conversion(settings, arm, duplicate=False):
+def run_conversion(settings, arm, duplicate=False, delete_source=False):
     settings.mmd_duplicate = duplicate
+    settings.mmd_delete_source = delete_source
+    settings.mmd_simplify = True
     settings.mmd_cleanup = True
     settings.mmd_translate_extras = True
     settings.mmd_rename_groups = True
@@ -265,11 +271,46 @@ def test_duplicate():
               for modifier in mesh.modifiers), "原网格还指向原骨架")
 
 
+def test_delete_source():
+    print("\n[8] 转换后删掉原 PMX 模型（1.4.3 默认）")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    settings = bpy.context.scene.pose_capture
+    arm = build_rig("MMD_Origin")
+    build_mesh(arm, "MMD_Origin_Mesh")
+    result = run_conversion(settings, arm, duplicate=True, delete_source=True)
+    check(result == {"FINISHED"}, "操作器返回 FINISHED", str(result))
+
+    left = [obj.name for obj in bpy.data.objects if obj.name.startswith("MMD_Origin")]
+    check(len(left) == 2 and not any(name[-3:].isdigit() for name in left),
+          "原模型被删掉，只剩骨架 + 网格且没有 .001", str(left))
+    new_arm = settings.armature
+    check(new_arm is not None and new_arm.name == "MMD_Origin", "新骨架接回原名（没有 .001）",
+          getattr(new_arm, "name", "?"))
+    check(new_arm is not None and "mixamorig:Hips" in new_arm.data.bones, "留下的是 Mixamo 骨架")
+    meshes = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+    check(len(meshes) == 1 and meshes[0].name == "MMD_Origin_Mesh",
+          "网格也接回原名", ", ".join(obj.name for obj in meshes) or "无")
+    check(settings.rig_type == "MIXAMO", "骨架标准自动切成 Mixamo", settings.rig_type)
+    check(settings.limb_mode == "FK", "肢体写入方式自动切成 FK", settings.limb_mode)
+    check(len(settings.bone_map) > 0 and bool(settings.bone_map[0].role),
+          "角色映射已同步", "%d 行" % len(settings.bone_map))
+    check("原 PMX 模型已删除" in (settings.mmd_result or ""), "面板写明了删除",
+          (settings.mmd_result or "")[:60])
+    check("骨骼映射" in (settings.mmd_result or ""), "面板写了映射角色数",
+          (settings.mmd_result or "")[-40:])
+
+
 def main():
     print("MMD → Mixamo Blender 自检")
-    test_in_place()
-    test_duplicate()
+    try:
+        test_in_place()
+        test_duplicate()
+        test_delete_source()
+    except Exception:  # noqa: BLE001  出错要看得见，不能静默退出
+        import traceback
 
+        traceback.print_exc()
+        failures.append("异常中断")
 
     print()
     if failures:

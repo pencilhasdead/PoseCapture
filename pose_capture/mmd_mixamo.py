@@ -143,6 +143,59 @@ def _norm(name: str) -> str:
     return unicodedata.normalize("NFKC", str(name)).strip().lower()
 
 
+# Unity Humanoid 的骨架槽位（按 Mixamo 骨名后缀）：简化时只保留这些「身体骨」
+UNITY_HUMANOID = {
+    "Hips", "Spine", "Spine1", "Spine2", "Neck", "Head",
+    "{Side}Eye", "{Side}Shoulder", "{Side}Arm", "{Side}ForeArm", "{Side}Hand",
+    # Unity 的 Toes 槽在 MMD 里可能只有「つま先」(Toe_End)，两种都留着
+    "{Side}UpLeg", "{Side}Leg", "{Side}Foot", "{Side}ToeBase", "{Side}Toe_End",
+    "{Side}HandThumb1", "{Side}HandThumb2", "{Side}HandThumb3",
+    "{Side}HandIndex1", "{Side}HandIndex2", "{Side}HandIndex3",
+    "{Side}HandMiddle1", "{Side}HandMiddle2", "{Side}HandMiddle3",
+    "{Side}HandRing1", "{Side}HandRing2", "{Side}HandRing3",
+    "{Side}HandPinky1", "{Side}HandPinky2", "{Side}HandPinky3",
+}
+
+# 这些“非标准骨”要保留（头发 / 裙子 / 飘带 / 胸 / 饰品 / 武器…），简化时不删
+ACCESSORY_WORDS = (
+    # 头发
+    "髪", "髮", "hair", "bangs", "劉海", "刘海", "アホ毛", "ahoge", "ツインテ", "twintail",
+    "ポニテ", "馬尾", "马尾", "ponytail", "braid", "お団子", "sideburn", "もみあげ",
+    # 裙子 / 服饰
+    "スカート", "skirt", "裙", "裾", "hem", "摆", "襬", "袖", "sleeve", "襟", "collar",
+    "リボン", "ribbon", "ネクタイ", "necktie", "領結", "結", "紐", "ひも", "string",
+    "帶", "带", "飘带", "飄帶", "sash", "マフラー", "scarf", "マント", "cape", "veil",
+    # 身体上要单独动的“软”部位
+    "胸", "breast", "おっぱい", "尻", "butt", "お尻", "腹", "belly",
+    # 饰品 / 尾巴 / 翅膀 / 道具
+    "尻尾", "しっぽ", "tail", "翼", "羽", "wing", "角", "horn", "耳", "ear",
+    "飾", "ornament", "アクセ", "accessory", "鎖", "chain", "鈴", "bell",
+    "武器", "剣", "刀", "sword", "gun", "杖", "staff", "傘", "umbrella", "prop",
+)
+
+
+def is_accessory(name: str) -> bool:
+    """名字看起来是头发 / 裙子 / 飘带 / 饰品（简化时要保留）。"""
+    text = unicodedata.normalize("NFKC", str(name))
+    lowered = text.lower()
+    return any(word in text or word.lower() in lowered for word in ACCESSORY_WORDS)
+
+
+_UNITY_BASES = {template.replace("{Side}", "") for template in UNITY_HUMANOID}
+
+
+def is_unity_humanoid_bone(mixamo_name: str | None) -> bool:
+    """Mixamo 名字是否落在 Unity Humanoid 的骨架槽位里（每手 3 节手指、没有脚趾尖）。"""
+    text = str(mixamo_name or "")
+    if not text:
+        return False
+    for side in ("Left", "Right"):
+        if text.startswith(side):
+            return text[len(side):] in _UNITY_BASES
+    return text in _UNITY_BASES
+
+
+
 def _expand(template: str, side: str) -> str:
     """把 {J}/{s}/{Side} 换成对应左右；side 为空时不替换（非左右骨）。"""
     if not side:
@@ -183,15 +236,40 @@ for _bone in BONES:
         for _alias in _bone[_conv]:
             _INDEX[_conv].setdefault(_norm(_alias), _bone)
 
+# 反向索引：已经换成 Mixamo 命名的骨（Hips / LeftHandMiddle1 / LeftToe_End）也能认回来
+_MIXAMO_INDEX: dict[str, dict] = {}
+for _bone in BONES:
+    if _bone["mixamo"]:
+        _MIXAMO_INDEX.setdefault(_norm(_bone["mixamo"]), _bone)
+
+
+def _strip_prefix(name: str) -> str:
+    """去掉 ``mixamorig:`` / ``Armature|mixamorig:`` 这类前缀，只留骨名。"""
+    text = unicodedata.normalize("NFKC", str(name)).strip()
+    if "|" in text:
+        text = text.rsplit("|", 1)[-1]
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    return text
+
 
 def lookup(name: str) -> dict | None:
-    """按 jp → en → blender 顺序查标准骨（认得 左腕 / arm_L / arm.L 三种写法）。"""
+    """按 jp → en → blender 顺序查标准骨（认得 左腕 / arm_L / arm.L 三种写法）。
+
+    已经转换成 Mixamo 命名的骨（``Hips`` / ``LeftHandMiddle1`` / ``mixamorig:Hips``）
+    也能认回来，所以同一根骨架重复转换是“什么都不改”。
+    """
     key = _norm(name)
     for conv in ("jp", "en", "blender"):
         hit = _INDEX[conv].get(key)
         if hit is not None:
             return hit
+    hit = _MIXAMO_INDEX.get(_norm(_strip_prefix(name)))
+    if hit is not None:
+        return hit
     return None
+
+
 
 
 def mixamo_name(name: str, prefix: str = MIXAMO_PREFIX) -> str | None:
@@ -287,8 +365,16 @@ def translate_extra_name(name: str) -> str:
 
 # --------------------------------------------------------------------------- 计划
 def plan_conversion(bone_names, parents=None, prefix: str = MIXAMO_PREFIX,
-                    cleanup: bool = True, translate_extras: bool = True) -> dict:
-    """纯逻辑：算出要改哪些名字 / 删哪些骨 / 谁挂到谁下面（不动 Blender 数据）。"""
+                    cleanup: bool = True, translate_extras: bool = True,
+                    simplify: bool = False) -> dict:
+    """纯逻辑：算出要改哪些名字 / 删哪些骨 / 谁挂到谁下面（不动 Blender 数据）。
+
+    ``simplify=True`` 时按 **Unity Humanoid** 的标准精简身体骨：只留
+    Hips / Spine / Spine1 / Spine2 / Neck / Head / 眼 / 肩 / 臂 / 前臂 / 手 /
+    UpperLeg / LowerLeg / Foot / Toes + 每只手 3 节手指，其余身体杂骨（腕捩 / 手捩 /
+    腰 / 上半身1 / 手先 …）删掉，权重并进最近的保留祖先；头发 / 裙子 / 飘带 / 胸 /
+    饰品等**全部保留**。
+    """
     names = [str(name) for name in bone_names]
     parents = {str(key): (str(value) if value else None)
                for key, value in (parents or {}).items()}
@@ -302,7 +388,9 @@ def plan_conversion(bone_names, parents=None, prefix: str = MIXAMO_PREFIX,
         kind, entry = classify(name)
         kinds[name] = kind
         if kind == "standard":
-            rename[name] = prefix + entry["mixamo"]
+            target = prefix + entry["mixamo"]
+            if target != name:              # 已经是 Mixamo 名字就不要再“改名”
+                rename[name] = target
             if entry["base"] == "lower_body":
                 hips = name
             elif entry["base"] == "upper_body":
@@ -326,6 +414,31 @@ def plan_conversion(bone_names, parents=None, prefix: str = MIXAMO_PREFIX,
             notes.append("没有「下半身」：用「センター」当 Hips")
         else:
             notes.append("⚠ 找不到「下半身 / センター」，Mixamo 的 Hips 无法确定")
+
+    # 按 Unity Humanoid 简化：身体骨只留 UNITY_HUMANOID 那套，其余“身体上的杂骨”
+    # （腕捩 / 手捩 / 腰 / 上半身1 / 手先 / 目先 …）删掉并把权重并进最近的保留祖先；
+    # 头发 / 裙子 / 飘带 / 胸 / 饰品一律不动。
+    simplified: list[str] = []
+    if simplify:
+        for name in names:
+            if name in delete or name in (hips, spine):
+                continue
+            if is_accessory(name):
+                continue
+            kind = kinds.get(name)
+            if kind == "control" and not cleanup:
+                continue
+            if kind == "standard":
+                # 标准骨里也有 Unity Humanoid 不要的：手指第 4 节 / 脚趾尖（Toe_End）
+                if is_unity_humanoid_bone((lookup(name) or {}).get("mixamo")):
+                    continue
+            if name not in delete:
+                delete.append(name)
+                simplified.append(name)
+            rename.pop(name, None)          # 要删的骨不用改名
+        if simplified:
+            notes.append("按 Unity Humanoid 简化：身体杂骨删 %d 根（权重并入父骨）"
+                         % len(simplified))
 
     # 被删骨的权重 / 子级要找“最近一个保留的祖先”
     def kept_ancestor(name: str):
@@ -380,8 +493,10 @@ def plan_conversion(bone_names, parents=None, prefix: str = MIXAMO_PREFIX,
         "hair": hair,
         "skirt": skirt,
         "kept": kept,
+        "simplified": simplified,
         "notes": notes,
     }
+
 
 
 
@@ -392,12 +507,16 @@ def summarize(plan: dict) -> str:
     prefixed = [target for target in rename.values()
                 if any(target.startswith(prefix) for prefix in MIXAMO_PREFIXES if prefix)]
     parts = ["改名 %d 根（Mixamo %d 根）" % (len(rename), len(prefixed)),
-             "删控制骨 %d 根" % len(plan.get("delete") or []),
+             "删控制骨 %d 根" % len([name for name in (plan.get("delete") or [])
+                                     if name not in (plan.get("simplified") or [])]),
              "保留头发 %d / 裙子 %d" % (len(plan.get("hair") or []),
                                        len(plan.get("skirt") or []))]
+    if plan.get("simplified"):
+        parts.append("Unity Humanoid 精简 %d 根" % len(plan["simplified"]))
     if plan.get("reparent"):
         parts.append("调整层级 %d 处" % len(plan["reparent"]))
     return "；".join(parts)
+
 
 
 # --------------------------------------------------------------------------- 执行（需要 bpy）
@@ -491,11 +610,16 @@ def apply_plan(arm_obj, plan: dict, rename_groups: bool = True,
         report["reparented"] += 1
 
     # 2) 改名：先挪到临时名，避免 A->B / B->A 撞车、或被 Blender 自动加 .001
+    #    要被删掉的骨不用改名（否则顶点组会先被改名、后面合并找不到）
+    deleted = set(plan.get("delete") or [])
     staged = {}
     for old, new in (plan.get("rename") or {}).items():
+        if old in deleted:
+            continue
         bone = edit_bones.get(old)
         if bone is None or old == new:
             continue
+
         temp = "__pc_tmp__%03d" % len(staged)
         bone.name = temp
         staged[temp] = (old, new)
@@ -519,8 +643,10 @@ def apply_plan(arm_obj, plan: dict, rename_groups: bool = True,
 
     # 4) 顶点组：改名 / 把被删骨的权重并进祖先 / 清掉没有去处的孤儿组
     if rename_groups:
-        mapping = dict(plan.get("rename") or {})
+        mapping = {old: new for old, new in (plan.get("rename") or {}).items()
+                   if old not in set(plan.get("delete") or [])}
         deleted_targets = plan.get("deleted_targets") or {}
+
         if merge_weights:
             rename = plan.get("rename") or {}
             for old, target in deleted_targets.items():

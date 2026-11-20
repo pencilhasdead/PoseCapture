@@ -48,6 +48,7 @@ class PC_Settings(PropertyGroup):
         name="自动匹配骨骼名", default=True,
         description="Apply 时如果骨骼名失效、或者肢体骨跟“肢体写入方式”不一致"
                     "（选了 IK 却映射到 FK 骨骼），就重新自动匹配（手动改过的行会被覆盖）")
+    diag_result: StringProperty(name="骨架诊断", default="")
 
     # ---------------- 检测参数 ----------------
     score_thr: FloatProperty(name="关键点置信度阈值", default=0.3, min=0.05, max=1.0)
@@ -97,6 +98,15 @@ class PC_Settings(PropertyGroup):
     mmd_duplicate: BoolProperty(
         name="先复制一份再改", default=True,
         description="保留原始 MMD 模型；关掉就直接改当前骨架（可 Ctrl+Z）")
+    mmd_delete_source: BoolProperty(
+        name="转换后删掉原 PMX 模型", default=True,
+        description="复制转换成功后，把原来那份 MMD 骨架和它的网格从场景里删掉"
+                    "（只保留转换好的 Mixamo 模型）")
+    mmd_simplify: BoolProperty(
+        name="按 Unity Humanoid 简化身体骨", default=True,
+        description="只留 Hips / Spine / Spine1 / Spine2 / Neck / Head / 眼 / 肩 / 臂 / 前臂 / 手 / "
+                    "UpperLeg / LowerLeg / Foot / Toes + 每手 3 节手指；腕捩 / 手捩 / 腰 / 上半身1 / "
+                    "手先 这类身体杂骨删掉、权重并进父骨。头发 / 裙子 / 飘带 / 胸 / 饰品一律保留")
     mmd_result: StringProperty(name="MMD → Mixamo 结果", default="")
 
     # ---------------- Goo Physics（头发 / 裙子 / 飘带） ----------------
@@ -111,10 +121,18 @@ class PC_Settings(PropertyGroup):
                ("GEO", "几何节点链（Geo Nodes）", ""),
                ("JIGGLE", "抖动（Jiggle，单骨）", "")],
         default="AUTO")
+    goo_selected_only: BoolProperty(
+        name="只对当前选中的骨加物理", default=False,
+        description="自己在 Pose 模式里选好骨，再点一键加物理：只处理选中的那些（"
+                    "真 MMD 模型常见上百根裙骨，全量处理会非常慢）")
+    goo_max_bones: IntProperty(
+        name="每组最多骨数", default=64, min=1, max=2000,
+        description="某一类（头发 / 裙子 / 飘带）超过这个数量时只处理前 N 根，并在结果里提示")
     goo_collider: BoolProperty(
         name="给身体网格加碰撞体", default=True,
         description="把带骨架修改器的网格交给 Goo Physics 生成碰撞体，裙子和头发才不会穿身体")
     goo_result: StringProperty(name="Goo Physics 结果", default="")
+
 
 
 

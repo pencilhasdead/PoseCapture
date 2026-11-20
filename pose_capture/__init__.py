@@ -6,12 +6,12 @@
 """
 # 注意：**扩展机制**（bl_ext.*）下 Blender 会在调用 register() 之前把 bl_info 从模块里删掉，
 # 所以 register() 里绝对不要引用 bl_info，统一用这个 __version__。
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 bl_info = {
     "name": "Pose Capture (SAM 3D Body / DWPose to Rigify)",
     "author": "Pose Capture",
-    "version": (1, 4, 2),
+    "version": (1, 4, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Pose Capture",
     "description": "读取图片，用 SAM 3D Body 或 DWPose + 深度模型识别人体骨架，并写入 Rigify 标准骨骼的 Pose",

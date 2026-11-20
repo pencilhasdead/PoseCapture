@@ -30,7 +30,8 @@ GOO_TYPES = {
 
 TYPE_LABELS = {"SOFT": "软体链", "CLOTH": "布料链", "GEO": "几何节点链", "JIGGLE": "抖动"}
 KINDS = ("hair", "skirt", "ribbon")
-KIND_LABELS = {"hair": "头发", "skirt": "裙子", "ribbon": "飘带"}
+KIND_LABELS = {"hair": "头发", "skirt": "裙子", "ribbon": "飘带", "custom": "选中骨"}
+
 _STATUS_CACHE: dict = {"time": 0.0, "value": None}
 
 
@@ -136,20 +137,36 @@ def _ensure_pose_mode(context, arm_obj) -> None:
         bpy.ops.object.mode_set(mode="POSE")
 
 
+def _set_bone_selected(pose_bone, state: bool) -> bool:
+    """选中 / 取消一根 pose 骨。
+
+    Blender 5.0 起骨头的选择状态挪到了 ``PoseBone.select``（``Bone.select`` 被删掉），
+    更早的版本正好相反，所以两个都试一遍，返回是否成功。
+    """
+    import bpy
+
+    order = (pose_bone, pose_bone.bone) if bpy.app.version[0] >= 5 \
+        else (pose_bone.bone, pose_bone)
+    for target in order:
+        if not hasattr(target, "select"):
+            continue
+        try:
+            target.select = state
+            return True
+        except (AttributeError, TypeError):
+            continue
+    return False
+
+
 def _select_pose_bones(arm_obj, names) -> list:
     """只选中给定骨头，并挑第一根当活动骨（Goo 的预设是套在活动骨上的）。"""
     wanted = set(names)
     picked = []
+    failed = 0
     for pose_bone in arm_obj.pose.bones:
         selected = pose_bone.name in wanted
-        try:
-            pose_bone.bone.select = selected
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            pose_bone.select = selected
-        except Exception:  # noqa: BLE001
-            pass
+        if not _set_bone_selected(pose_bone, selected):
+            failed += 1
         if selected:
             picked.append(pose_bone)
     if picked:
@@ -157,7 +174,15 @@ def _select_pose_bones(arm_obj, names) -> list:
             arm_obj.data.bones.active = picked[0].bone
         except Exception:  # noqa: BLE001
             pass
+    if failed == len(arm_obj.pose.bones):
+        try:
+            from . import utils
+
+            utils.warn("这个 Blender 版本里选不中骨头（PoseBone.select 用不了）")
+        except Exception:  # noqa: BLE001
+            print("[PoseCapture] WARNING: 选不中骨头（PoseBone.select 用不了）")
     return picked
+
 
 
 def bones_by_kind(arm_obj) -> dict[str, list[str]]:
@@ -181,9 +206,22 @@ def mesh_objects(arm_obj) -> list:
 
 
 
+def selected_pose_bones(context, arm_obj) -> list:
+    """当前 Pose 模式里真正被选中的骨头（Blender 的 ``context.selected_pose_bones``）。"""
+    if context.object is not arm_obj:
+        return []
+    return list(context.selected_pose_bones or [])
+
+
 def apply(context, arm_obj, kinds, requested_type: str = "AUTO",
-          add_collider: bool = True) -> dict:
-    """给选中的几类骨一键加物理，返回报告。"""
+          add_collider: bool = True, max_bones: int = 0,
+          selected_only: bool = False) -> dict:
+    """给选中的几类骨一键加物理，返回报告。
+
+    ``max_bones`` > 0 时，每类骨最多只处理这么多根（真 MMD 模型动辄上百根裙骨，
+    Goo 会建同样多的模拟物体，全量做要很久）；``selected_only=True`` 时只用
+    用户在 Pose 模式里自己选中的骨。
+    """
     import bpy
 
     info = status()
@@ -198,27 +236,58 @@ def apply(context, arm_obj, kinds, requested_type: str = "AUTO",
         report["warnings"].append("读不到 Goo Physics 的偏好设置")
         return report
 
-    groups = bones_by_kind(arm_obj)
     _ensure_pose_mode(context, arm_obj)
+    context.view_layer.update()
+
+    groups = bones_by_kind(arm_obj)
+    if selected_only:
+        chosen = [pb.name for pb in selected_pose_bones(context, arm_obj)]
+        if not chosen:
+            report["warnings"].append("Pose 模式里没有选中的骨：先选好头发 / 裙子骨再点，"
+                                      "或者关掉「只对当前选中的骨加物理」")
+            return report
+        chosen_set = set(chosen)
+        picked_groups = {kind: [name for name in groups.get(kind) or [] if name in chosen_set]
+                         for kind in kinds}
+        if not any(picked_groups.values()):
+            # 选中的骨名字认不出类别：用户选什么就按统一类型加什么
+            picked_groups = {"custom": chosen}
+        groups = picked_groups
+    else:
+        groups = {kind: groups.get(kind) or [] for kind in kinds}
+
     done = 0
-    for kind in kinds:
-        names = groups.get(kind) or []
+    for kind, names in groups.items():
+        names = list(names or [])
         if not names:
             continue
-        key = type_for_kind(kind, requested_type)
+        if max_bones and len(names) > max_bones:
+            report["warnings"].append("%s %d 根骨，超过上限 %d：只处理前 %d 根（想全做就"
+                                      "调高「每组最多骨数」或用『只对选中骨加物理』分批）"
+                                      % (KIND_LABELS.get(kind, kind), len(names), max_bones,
+                                         max_bones))
+            names = names[:max_bones]
+        key = "SOFT" if (kind == "custom" and str(requested_type).upper() == "AUTO") \
+            else type_for_kind(kind, requested_type)
         pref_value, operator_short, flag = GOO_TYPES[key]
         prefs.gp_physics_type = pref_value
         picked = _select_pose_bones(arm_obj, names)
         if not picked:
             continue
         context.view_layer.update()
+        actual = [pb for pb in selected_pose_bones(context, arm_obj)
+                  if pb.name in {name for name in names}]
+        if len(actual) < len(picked):
+            report["warnings"].append("%s：选中 %d 根，但 Blender 只认到 %d 根"
+                                      % (KIND_LABELS.get(kind, kind), len(picked), len(actual)))
         try:
             result = getattr(bpy.ops.goophys, operator_short)()
         except Exception as exc:  # noqa: BLE001
-            report["warnings"].append("%s 加物理失败：%s" % (KIND_LABELS[kind], exc))
+            report["warnings"].append("%s 加物理失败：%s" % (KIND_LABELS.get(kind, kind), exc))
             continue
         if "FINISHED" not in result:
-            report["warnings"].append("%s 加物理被取消（%s）" % (KIND_LABELS[kind], result))
+            report["warnings"].append("%s 加物理被取消（%s）"
+                                      % (KIND_LABELS.get(kind, kind), result))
             continue
         attached = [pb for pb in picked if getattr(pb, flag, False)]
         report["groups"][kind] = {"bones": len(names), "type": key,
@@ -228,7 +297,9 @@ def apply(context, arm_obj, kinds, requested_type: str = "AUTO",
             done += len(attached)
         else:
             report["warnings"].append("%s：调用了 goophys.%s，但骨头上没有物理标记"
-                                      "（可能没选上）" % (KIND_LABELS[kind], operator_short))
+                                      "（可能没选上）" % (KIND_LABELS.get(kind, kind),
+                                                         operator_short))
+
 
 
     if done and hasattr(prefs, "gp_physics_active"):

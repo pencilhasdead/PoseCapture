@@ -177,6 +177,20 @@ python dev_tests/install_local.py --dry-run  # 只看会改哪些目录，不动
 > `gp_has_*_physics` 标记；自动打开 Physics Active；可一键给身体网格加碰撞体，也可一键移除）。
 > 实测：头发 3 根→软体链、裙子 3 根→布料链、飘带 2 根→软体链，碰撞体生成，移除后标记全清（见 **5.4**）。
 > 自检：`test_mixamo_target.py`、`test_goo_physics.py`。
+> **1.4.3**：① MMD → Mixamo 默认 **按 Unity Humanoid 简化身体骨**（只留 Hips / Spine / Spine1 /
+> Spine2 / Neck / Head / 眼 / 肩 / 臂 / 前臂 / 手 / UpperLeg / LowerLeg / Foot / Toes + 每手 3 节手指，
+> 手指第 4 节、腕捩 / 手捩 / 腰 / 上半身1 / 手先 这类身体杂骨删掉、权重并进父骨；**头发 / 裙子 /
+> 飘带 / 胸 / 饰品一根不删**），转换成功后默认把**原 PMX 模型整份删掉**（骨架 + 网格 + 数据块，
+> 并把 `.001` 后缀还回来），同时自动把 `骨架标准` 切成 `Mixamo 标准`、`肢体写入方式` 切成 `FK`。
+> 真机实测（340 根骨）→ **262 根**（删 78 = 23 根控制骨 + 55 根身体杂骨，头发 81 / 裙子 112 /
+> 飘带 1 全部保留），映射角色 52 个。② Mixamo 匹配**更宽容**：除了 `mixamorig:` / `mixamorig1:` /
+> 无前缀，还认 `Armature|mixamorig:LeftArm`、`mixamorig_LeftArm`、`Hips.001`、大小写不同，以及
+> Unity Humanoid 自己的骨名（`LeftUpperArm` / `LeftLowerArm` / `LeftUpperLeg` / `LeftLowerLeg` /
+> `Toes` / `Chest` / `UpperChest`）；一个角色都对不上时**自动切换骨架标准**；新增
+> **诊断（骨架 + 物理）** 按钮，把骨名样例 / 前缀 / 两种标准各匹配到几个 / 缺哪些 / 物理可加骨
+> 全打进日志面板。③ 一键物理：新增 **每组最多骨数**（默认 64）与 **只对当前选中的骨加物理**，
+> 真 MMD 模型上百根裙骨不会再一次性把 Goo 塞爆；选骨改用 Blender 5 的 `PoseBone.select`
+> （`Bone.select` 在 5.0 已被删掉），并核对选骨是否真的生效。
 
 
 
@@ -321,7 +335,7 @@ Linux: 解压到 ~/.config/blender/<版本>/datafiles/
 
 | 参数 | 说明 |
 | --- | --- |
-| **骨架标准** | `Rigify 标准`（默认）：按 `spine_fk` / `upper_arm_fk.L` / `torso` 这套名字匹配；`Mixamo 标准`：按 `mixamorig:Hips` / `LeftArm` / `LeftUpLeg` 这套匹配（前缀 `mixamorig` / `mixamorig1:` / 无前缀都能自动认，见 **5.3**） |
+| **骨架标准** | `Rigify 标准`（默认）：按 `spine_fk` / `upper_arm_fk.L` / `torso` 这套名字匹配；`Mixamo 标准`：按 `mixamorig:Hips` / `LeftArm` / `LeftUpLeg` 这套匹配（`mixamorig` / `mixamorig1:` / 无前缀 / `Armature\|mixamorig:` / `Hips.001` 都能认，也认 Unity Humanoid 的 `LeftUpperArm` / `LeftLowerLeg` / `Toes` 写法；一个都对不上时自动切换，见 **5.3**） |
 | **3D 来源** | `自动`（默认）：SAM 3D Body 配置齐全就用它，否则退回下面的「深度来源」；`SAM 3D Body`：单图直接出 MHR 人体（含手指 / 脚，带人体先验，见 **5.1**，需要外部 python 环境）；`DWPose + 深度模型`；`骨长解算` |
 
 | 人体框 / 关键点置信度阈值 | 检测的过滤阈值。检测不到人就降低人体框阈值；关键点乱飘就提高关键点阈值 |
@@ -502,31 +516,34 @@ hf download facebook/sam-3d-body-dinov3 --local-dir checkpoints\sam-3d-body-dino
 | Mixamo 前缀 | `mixamorig:` | 同场景多角色用 `mixamorig1:`；也可以不要前缀 |
 | 删除 MMD 控制骨 | 开 | IK / センター / 全ての親 这些 Mixamo 没有槽位的骨 |
 | 头发 / 裙子等骨骼名翻成英文 | 开 | 只是改名，骨骼本身保留 |
+| **按 Unity Humanoid 简化身体骨** | 开 | 身体骨只留 Unity Humanoid 那套；手指第 4 节 + 腕捩 / 手捩 / 腰 / 上半身1 / 手先 等删掉、权重并进父骨。头发 / 裙子 / 飘带 / 胸 / 饰品整根保留 |
 | 同步重命名顶点组 | 开 | 关掉 = 蒙皮全丢，面板会警告 |
 | 被删骨骼的权重并入父骨 | 开 | 例：足D 的权重 → `LeftUpLeg` |
 | 摘掉 MMD Tools 追加变换 | 开 | 骨骼约束 + 驱动器 |
-| 先复制一份再改 | 开 | 保留原始 MMD 模型 |
+| 先复制一份再改 | 开 | 在副本上改（原模型不动） |
+| **转换后删掉原 PMX 模型** | 开 | 复制改完把原来那份骨架 + 网格整份删掉，只留转换好的 Mixamo 模型；删完把 `.001` 后缀还回去。关掉 = 原模型留着 |
 
 **转换后要上传 Mixamo / 做重定向时注意**：
 
-* 这一步**只改名字和层级**，不动静止姿势（MMD 是 A-pose、Mixamo 是 T-pose）。要上传 Mixamo
+* 这一步**只改名字、层级和骨数**，不动静止姿势（MMD 是 A-pose、Mixamo 是 T-pose）。要上传 Mixamo
   自动绑定时先摆成 T-pose；用 Mixamo 动画驱动 MMD 模型（重定向）时，静止姿势差异由重定向工具处理；
 * 骨架 / 物体缩放要是 1（不是 1 就 `Ctrl+A` 应用缩放），面板会提示；
-* `腕捩 / 手捩` 这类捩り骨会**保留**成额外骨（`arm_twist.L` …），它们跟着 `Arm` 继承；
-  Mixamo 不认这些槽位，但删了会掉体积，所以默认保留；
-* 这一步跑完，插件自己的「应用到骨架」仍然认 `mixamorig:LeftArm` 这类名字吗？**不认** ——
-  `自动匹配骨骼` 是按 Rigify / 元骨架的名字匹配的。要抓姿态请用 Rigify 骨架，别用转换后的 MMD 骨架。
+* 勾了「按 Unity Humanoid 简化」时 `腕捩 / 手捩` 这类捩り骨会被**删掉并把权重并进 `Arm` /
+  `ForeArm`**（体积不会掉，只是没有单独的扭转骨了）；想留着就关掉那个选项（会保留成 `arm_twist.L` …）；
+* 这一步跑完，插件自己的「应用到骨架」可以直接用：转换成功后会自动把 `骨架标准` 切成
+  **Mixamo 标准**、`肢体写入方式` 切成 **FK**，并顺手把角色映射好（见 **5.3**）。
 
 **真机实测**（仓库里那份「星穹铁道—流萤」PMX，2.2 MB，340 根骨）：
 
 | 项 | 结果 |
 | --- | --- |
 | 骨架 | `下半身 → mixamorig:Hips`、`上半身 → Spine`、`上半身2 → Spine1`，Spine 已挂到 Hips 下 |
-| 映射 | 65 根 → Mixamo（含 15 根手指、`右目/左目 → RightEye/LeftEye`、`右足先EX → ToeBase`）；总改名 292 根，**无重名** |
-| **头发** | 认出 **81 根**（`左後髪1-1 → back_hair1_1.L`、`左馬尾1-1 → ponytail1_1.L`、`中劉海1 → mid_bangs1`、`髮帶…`），**一根没删** |
+| 映射 | 65 根 → Mixamo（含 15 根手指、`右目/左目 → RightEye/LeftEye`、`右足先EX → ToeBase`） |
+| **Unity Humanoid 简化** | 身体杂骨删 **55** 根（腕捩 / 手捩 / 腰 / 上半身1 / 手先 / 手指第 4 节 …），权重并进父骨 |
+| **头发** | 认出 **81 根**（`左後髪1-1 → back_hair1_1.L`、`左馬尾1-1 → ponytail1_1.L`、`中劉海1 → mid_bangs1`），**一根没删** |
 | **裙子** | 认出 **112 根**（`裙_0_0 → skirt_0_0` … 这款模型用的是中文「裙」），**一根没删** |
 | 控制骨 | 删 23 根（全ての親 / センター / グルーブ / 足IK親 / 足ＩＫ / つま先ＩＫ / 肩P / 肩C / ダミー / 腰キャンセル） |
-| 保留 | 317 根；只剩 19 根名字翻不了（`操作中心`、`腰`、`肩+`、`髪翼飾`…）→ 原样保留 |
+| 结果 | **340 → 262 根**（保留 81 + 112 + 1 根饰品 + Unity Humanoid 那套），映射角色 52 个 |
 
 
 ---
@@ -547,10 +564,19 @@ hf download facebook/sam-3d-body-dinov3 --local-dir checkpoints\sam-3d-body-dino
 | 手指 | `{Side}HandThumb1..3`、`HandIndex1..3`、`HandMiddle1..3`、`HandRing1..3`、`HandPinky1..3` |
 
 * **前缀自动探测**：`mixamorig:` / `mixamorig1:`（同场景多角色）/ 无前缀三种都认；
+* **宽容匹配**（1.4.3）：名字里的 `Armature|mixamorig:`、`mixamorig_`（下划线）、`Hips.001`
+  （Blender 重名后缀）、大小写差异都能吃掉；也认 **Unity Humanoid 自己的骨名** ——
+  `LeftUpperArm` / `LeftLowerArm` / `LeftUpperLeg` / `LeftLowerLeg` / `Toes` / `Chest` / `UpperChest`
+  / `Pelvis`（导出到 Unity 的 FBX 常见这套名字）；
+* **自动切换标准**：点 `自动匹配骨骼` / `应用到骨架` 时，如果当前标准一个角色都对不上、而另一边能对上，
+  会自动把 `骨架标准` 切过去并写日志（不会再出现“什么都没匹配到”）；
+* **诊断按钮**：`2. 目标骨架` → **诊断（骨架 + 物理）**，日志面板会打出骨名样例、探测到的前缀、
+  两种标准各匹配到几个角色 / 缺哪些、能加物理的骨数、Goo Physics 状态 —— 匹配不上时先点它；
 * 不需要 IK / 快照那套（Mixamo 骨架没有 Rigify 的控制器），写入方式是纯 FK；
 * 点「新建元骨架 / 生成控制骨架」时会自动把 `骨架标准` 切回 `Rigify 标准`（那两根按钮造的是 Rigify 骨架）；
 * 实测（合成 Mixamo 骨架 + SAM 3D Body 的姿态）：`LeftArm` / `LeftForeArm` / `RightUpLeg` /
-  `RightLeg` / `Head` 与解算方向的误差 **0.00~0.02°**。
+  `RightLeg` / `Head` 与解算方向的误差 **0.00~0.02°**；Unity Humanoid 命名（`LeftUpperArm` …）与
+  `Armature|mixamorig:` 前缀两套变体各匹配到 **33 个角色**（`test_mixamo_target.py` 的 `[4]`）。
 
 ### 5.4 一键给头发 / 裙子 / 飘带加 Goo Physics
 
@@ -578,11 +604,23 @@ hf download facebook/sam-3d-body-dinov3 --local-dir checkpoints\sam-3d-body-dino
    gp_has_jg_physics`，面板会写「头发 3 根（软体链，已挂 3）；裙子 3 根（布料链，已挂 3）；碰撞体已生成」；
 6. 还有一个 **移除这些骨上的物理**（`goophys.remove_physics_from_selected`）。
 
+数量控制（1.4.3，真 MMD 模型动辄 190+ 根）：
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| 每组最多骨数 | 64 | 某一类（头发 / 裙子 / 飘带）超过就只处理前 N 根，并在结果里写「⚠ 头发 81 根骨，超过上限 64：只处理前 64 根」 |
+| 只对当前选中的骨加物理 | 关 | 自己在 Pose 模式选好骨再点，只处理选中的（骨多时建议这样分批；名字认不出类别也照选什么加什么） |
+
+> 为什么默认要限流：Goo 的「链」是一串父子骨，MMD 的裙子常常是 100+ 根各自独立的单骨，
+> 全量处理 = 100+ 个软体 / 布料物体，视口会卡到不能动，而且第一次算烘焙非常慢。
+
 注意事项：
 * **Jiggle（抖动）只适合单根骨**，而且要求骨头是「断开父级 / 保持偏移」（Goo 自己的限制），
   头发 / 裙子链请用软体或布料；
 * 预设、阻尼、风力、烘焙仍在 **Goo Physics 自己的面板**（`N` 面板 → Goo Animation Tools）里调；
-* 骨架必须能进 **Pose 模式**（Goo 的操作器读的是 pose 模式下的选骨），插件会自动切过去；
+* 骨架必须能进 **Pose 模式**（Goo 的操作器读的是 pose 模式下的选骨），插件会自动切过去，
+  并核对 `context.selected_pose_bones` 里真的有这些骨（Blender 5.0 起骨选择是 `PoseBone.select`，
+  旧版是 `Bone.select`，插件按版本自动选对）；
 * 没装 / 没启用 Goo Physics 时面板会直接说清楚（“装了但没启用” / “没有找到”），不会静默失败。
 
 ---
@@ -777,8 +815,8 @@ Pose Capture/
 │  ├─ test_mmd_mixamo.py    MMD → Mixamo 纯逻辑自检（映射 / 层级 / 保留头发裙子；普通 Python 可跑）
 │  ├─ test_mmd_mixamo_rig.py MMD → Mixamo 真骨架自检（合成 MMD 骨架 + 顶点组权重 + 复制模式）
 │  ├─ test_mmd_mixamo_pmx.py MMD → Mixamo 真实 PMX 自检（读骨骼表，不需要 Blender / MMD Tools）
-│  ├─ test_mixamo_target.py Mixamo 标准骨架自检（映射 / 前缀 / read_metrics / apply_pose）
-│  ├─ test_goo_physics.py   Goo Physics 一键加物理自检（分类 / 选骨 / 挂物理 / 碰撞体 / 移除）
+│  ├─ test_mixamo_target.py Mixamo 标准骨架自检（映射 / 前缀 / read_metrics / apply_pose / Unity Humanoid 变体）
+│  ├─ test_goo_physics.py   Goo Physics 一键加物理自检（分类 / 选骨 / 挂物理 / 碰撞体 / 上限 / 只对选中骨 / 移除）
 │  ├─ test_rigify_limbs.py  Rigify 肢体 IK 控制器自检（直写 + 快照退回 / 显示同步）
 │  ├─ _diag_ik_frames.py    Rigify 结构诊断（IK 控制器 / 极向目标 / 约束 vs FK 链；排错用）
 │  ├─ test_depth_view.py    深度预览自检（黑图回归 / PNG / 预览页面数据）

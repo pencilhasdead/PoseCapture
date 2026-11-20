@@ -162,12 +162,102 @@ def test_apply():
     print("     最大方向误差 %.2f°" % worst)
 
 
+def _unity_name(name, table):
+    for side in ("Left", "Right"):
+        if name.startswith(side):
+            rest = name[len(side):]
+            return side + table.get(rest, rest)
+    return table.get(name, name)
+
+
+def unity_skeleton(prefix=""):
+    """Unity Humanoid 的骨名（``LeftUpperArm`` / ``LeftLowerLeg`` / ``Toes``…）。"""
+    table = {
+        "Spine1": "Chest", "Spine2": "UpperChest",
+        "Arm": "UpperArm", "ForeArm": "LowerArm",
+        "UpLeg": "UpperLeg", "Leg": "LowerLeg",
+        "ToeBase": "Toes", "Toe_End": "Toes",
+    }
+    rows = []
+    for name, parent, head, tail in mixamo_skeleton(prefix):
+        base = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        parent_base = None
+        if parent:
+            parent_base = parent[len(prefix):] if prefix and parent.startswith(prefix) else parent
+        rows.append((prefix + _unity_name(base, table),
+                     (prefix + _unity_name(parent_base, table)) if parent_base else None,
+                     head, tail))
+    return rows
+
+
+def build_armature_from(rows, name):
+    armature = bpy.data.armatures.new(name)
+    arm = bpy.data.objects.new(name, armature)
+    bpy.context.scene.collection.objects.link(arm)
+    bpy.context.view_layer.objects.active = arm
+    arm.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    made = {}
+    for bone_name, parent, head, tail in rows:
+        bone = armature.edit_bones.new(bone_name)
+        bone.head = head
+        bone.tail = tail
+        made[bone_name] = bone
+    for bone_name, parent, _head, _tail in rows:
+        if parent and parent in made and parent != bone_name:
+            made[bone_name].parent = made[parent]
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return arm
+
+
+def test_variants():
+    print("\n[4] 真实 FBX / Unity Humanoid 命名变体")
+    cases = (
+        ("Unity Humanoid 骨名", "UnityRig"),
+        ("Armature|mixamorig: 前缀（FBX）", "ARMATURE"),
+    )
+    for label, name in cases:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        if label.startswith("Armature|"):
+            rows = unity_skeleton("Armature|mixamorig:")
+            arm = build_armature_from(rows, name)
+            prefix = detect = "Armature|mixamorig:"
+        else:
+            rows = unity_skeleton("")
+            arm = build_armature_from(rows, name)
+            detect = ""
+        bmap = rigify_map.auto_detect(arm, True, {"Arm": "FK", "Leg": "FK"}, "MIXAMO")
+        check(len(bmap.roles) >= 30, "%s：匹配角色数" % label, "%d 个" % len(bmap.roles))
+        for role, expect_suffix in (("hips", "Hips"), ("upper_arm.L", "UpperArm"),
+                                    ("forearm.R", "LowerArm"), ("thigh.L", "UpperLeg"),
+                                    ("shin.R", "LowerLeg"), ("toe.L", "Toes")):
+            got = bmap.get(role) or ""
+            check(got.endswith(expect_suffix), "%s：%s" % (label, role), got or "（空）")
+        metrics = rigify_map.read_metrics(arm, bmap)
+        check(not metrics.get("errors"), "%s：read_metrics" % label,
+              "；".join(metrics.get("errors") or []) or "ok")
+        if label.startswith("Armature|"):
+            check(rigify_map.detect_mixamo_prefix(
+                [bone.name for bone in arm.data.bones]) == "Armature|mixamorig:",
+                "认出 Armature|mixamorig: 里的前缀（FBX）",
+                repr(rigify_map.detect_mixamo_prefix(
+                    [bone.name for bone in arm.data.bones])))
+
+
 def main():
     print("Mixamo 目标骨架自检")
-    test_mapping()
-    test_prefixes()
-    test_apply()
+    try:
+        test_mapping()
+        test_prefixes()
+        test_apply()
+        test_variants()
+    except Exception:  # noqa: BLE001  出错要看得见，不能静默退出
+        import traceback
+
+        traceback.print_exc()
+        failures.append("异常中断")
     print()
+
     if failures:
         print("!! 失败 %d 项：%s" % (len(failures), ", ".join(failures)))
         return 1

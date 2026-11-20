@@ -116,7 +116,13 @@ class PC_PT_main(bpy.types.Panel):
         row = box.row(align=True)
         row.operator("pose_capture.auto_map", text="自动匹配骨骼")
         row.operator("pose_capture.reset_pose", text="清空 Pose")
+        box.operator("pose_capture.diag_report", icon="QUESTION",
+                     text="诊断（匹配不到骨时先点这个）")
         box.prop(settings, "auto_map_on_apply")
+        if settings.diag_result:
+            for line in settings.diag_result.split("；")[:3]:
+                box.label(text=line[:70], icon="DOT")
+
         if settings.armature is not None:
             box.label(text="骨骼数：%d" % len(settings.armature.data.bones))
 
@@ -274,13 +280,18 @@ class PC_PT_mmd(bpy.types.Panel):
         if settings.mmd_rename_groups:
             col.prop(settings, "mmd_merge_weights")
         col.prop(settings, "mmd_strip_helpers")
+        col.prop(settings, "mmd_simplify")
         col.prop(settings, "mmd_duplicate")
+        if settings.mmd_duplicate:
+            col.prop(settings, "mmd_delete_source")
         col.operator("pose_capture.mmd_to_mixamo", icon="ARMATURE_DATA",
-                     text="转换（保留头发 / 裙子骨）")
+                     text="转换（Unity Humanoid + 保留头发 / 裙子骨）")
         if settings.mmd_result:
             for index, line in enumerate(settings.mmd_result.split("；")):
                 col.label(text=line[:70], icon="CHECKMARK" if index == 0 else "DOT")
-        col.label(text="骨头一根不删（除 MMD 控制骨），头发/裙子骨跟着改名保留", icon="INFO")
+        col.label(text="勾了简化：身体骨按 Unity Humanoid 精简，头发/裙子/飘带整根保留",
+                  icon="INFO")
+
 
 
 class PC_PT_physics(bpy.types.Panel):
@@ -319,6 +330,9 @@ class PC_PT_physics(bpy.types.Panel):
         row.prop(settings, "goo_ribbon")
         col.prop(settings, "goo_type")
         col.prop(settings, "goo_collider")
+        col.prop(settings, "goo_selected_only")
+        if not settings.goo_selected_only:
+            col.prop(settings, "goo_max_bones")
         col.operator("pose_capture.goo_physics_add", icon="PHYSICS",
                      text="一键加物理")
         col.operator("pose_capture.goo_physics_remove", icon="X",
@@ -327,7 +341,11 @@ class PC_PT_physics(bpy.types.Panel):
             for index, line in enumerate(settings.goo_result.split("；")):
                 col.label(text=line[:70],
                           icon="CHECKMARK" if index == 0 and "⚠" not in line else "DOT")
+        if len(groups["skirt"]) > 60 or len(groups["hair"]) > 60:
+            col.label(text="骨很多时建议先选一部分，勾「只对当前选中的骨」分批加",
+                      icon="ERROR")
         col.label(text="类型/预设/烘焙在 Goo Physics 自己的面板里改", icon="INFO")
+
 
 
 CLASSES = (PC_UL_bone_map, PC_PT_main, PC_PT_mapping, PC_PT_log, PC_PT_mmd, PC_PT_physics)
